@@ -150,11 +150,13 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
 
 def _get_stream_url(track: Track) -> str:
     opts = _yt_opts({
+        "check_formats":       False,
+        "no_check_certificate": True,
+        "skip_download":       True,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
         },
     })
-    # Không set format — để yt-dlp tự chọn format tốt nhất
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(track.url, download=False)
         formats = info.get("formats", [])
@@ -163,12 +165,12 @@ def _get_stream_url(track: Track) -> str:
         for f in reversed(formats):
             url = f.get("url", "")
             if url and f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none":
-                log.info("Using audio format: %s %s", f.get("ext"), f.get("abr"))
+                log.info("Using audio: ext=%s abr=%s", f.get("ext"), f.get("abr"))
                 return url
         # Fallback: bất kỳ format nào có URL
         for f in reversed(formats):
             if f.get("url"):
-                log.info("Using fallback format: %s", f.get("ext"))
+                log.info("Fallback: ext=%s", f.get("ext"))
                 return f["url"]
         if info.get("url"):
             return info["url"]
