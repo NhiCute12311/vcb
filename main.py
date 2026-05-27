@@ -145,18 +145,32 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
     ]
 
 def _get_stream_url(track: Track) -> str:
-    opts = _yt_opts({
-        "format":      "bestaudio/best",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
-        },
-    })
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(track.url, download=False)
-        for f in reversed(info.get("formats", [])):
-            if f.get("acodec") != "none" and f.get("vcodec") == "none":
-                return f["url"]
-        return info.get("url") or info["formats"][-1]["url"]
+    # Thử từng format — không dùng format string phức tạp
+    for fmt in ["bestaudio", "worstaudio", "best", "worst"]:
+        try:
+            opts = _yt_opts({
+                "format": fmt,
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
+                },
+            })
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(track.url, download=False)
+                # Lấy URL từ formats
+                formats = info.get("formats", [])
+                for f in reversed(formats):
+                    url = f.get("url", "")
+                    if url and f.get("acodec", "none") != "none":
+                        return url
+                # Fallback
+                if info.get("url"):
+                    return info["url"]
+                if formats:
+                    return formats[-1]["url"]
+        except Exception as e:
+            log.warning("Format %s failed: %s", fmt, e)
+            continue
+    raise Exception("Không lấy được stream URL")
 
 def _get_video_urls(track: Track):
     """Trả về URL video chất lượng thấp để giảm lag."""
