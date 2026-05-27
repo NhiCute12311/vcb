@@ -11,15 +11,10 @@ Chạy:
     py -3.11 vc_bot_fixed.py
 """
 
-# ── Fix event loop (Windows cần, Linux bỏ qua) ────
+# ── Fix event loop cho mọi Python version ────────
 import asyncio
-try:
-    _loop = asyncio.get_event_loop()
-    if _loop.is_closed():
-        raise RuntimeError
-except RuntimeError:
-    _loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_loop)
+_loop = asyncio.new_event_loop()
+asyncio.set_event_loop(_loop)
 
 import os, re, sys, logging
 from collections import deque
@@ -718,8 +713,20 @@ async def main():
     ub_me = await userbot.get_me()
     log.info("✅ Userbot: %s (@%s)", ub_me.first_name, ub_me.username or "no username")
 
-    # Khởi động bot
-    await bot.start()
+    # Khởi động bot — xử lý FloodWait
+    for attempt in range(5):
+        try:
+            await bot.start()
+            break
+        except Exception as e:
+            err = str(e)
+            if "FLOOD_WAIT" in err:
+                import re as _re
+                wait = int(_re.search(r"wait of (\d+)", err).group(1)) if _re.search(r"wait of (\d+)", err) else 60
+                log.warning("FloodWait: chờ %d giây...", wait)
+                await asyncio.sleep(min(wait, 300))
+            else:
+                raise
     bot_me = await bot.get_me()
     log.info("✅ Bot: @%s", bot_me.username)
 
