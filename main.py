@@ -107,6 +107,10 @@ def _is_url(text: str) -> bool:
     return text.startswith("http://") or text.startswith("https://") or "youtu" in text
 
 _COOKIES_FILE = "cookies.txt" if os.path.exists("cookies.txt") else None
+if _COOKIES_FILE:
+    import logging as _l; _l.getLogger("vcbot").info("Cookies file found: %s", _COOKIES_FILE)
+else:
+    import logging as _l; _l.getLogger("vcbot").warning("No cookies.txt found — YouTube may block requests")
 
 def _yt_opts(extra: dict = {}) -> dict:
     opts = {"quiet": True, "no_warnings": True, **extra}
@@ -145,32 +149,30 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
     ]
 
 def _get_stream_url(track: Track) -> str:
-    # Thử từng format — không dùng format string phức tạp
-    for fmt in ["bestaudio", "worstaudio", "best", "worst"]:
-        try:
-            opts = _yt_opts({
-                "format": fmt,
-                "http_headers": {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
-                },
-            })
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(track.url, download=False)
-                # Lấy URL từ formats
-                formats = info.get("formats", [])
-                for f in reversed(formats):
-                    url = f.get("url", "")
-                    if url and f.get("acodec", "none") != "none":
-                        return url
-                # Fallback
-                if info.get("url"):
-                    return info["url"]
-                if formats:
-                    return formats[-1]["url"]
-        except Exception as e:
-            log.warning("Format %s failed: %s", fmt, e)
-            continue
-    raise Exception("Không lấy được stream URL")
+    opts = _yt_opts({
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
+        },
+    })
+    # Không set format — để yt-dlp tự chọn format tốt nhất
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(track.url, download=False)
+        formats = info.get("formats", [])
+        log.info("Available formats: %d", len(formats))
+        # Ưu tiên audio only
+        for f in reversed(formats):
+            url = f.get("url", "")
+            if url and f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none":
+                log.info("Using audio format: %s %s", f.get("ext"), f.get("abr"))
+                return url
+        # Fallback: bất kỳ format nào có URL
+        for f in reversed(formats):
+            if f.get("url"):
+                log.info("Using fallback format: %s", f.get("ext"))
+                return f["url"]
+        if info.get("url"):
+            return info["url"]
+    raise Exception("Không có format nào khả dụng")
 
 def _get_video_urls(track: Track):
     """Trả về URL video chất lượng thấp để giảm lag."""
