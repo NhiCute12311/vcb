@@ -107,10 +107,25 @@ if _COOKIES_FILE:
 else:
     import logging as _l; _l.getLogger("vcbot").warning("No cookies.txt found — YouTube may block requests")
 
+# PO Token để bypass YouTube bot check (không cần cookies)
+_PO_TOKEN = ""  # Để trống — dùng cookies thay thế
+
 def _yt_opts(extra: dict = {}) -> dict:
-    opts = {"quiet": True, "no_warnings": True, **extra}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["web", "android"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
+        **extra
+    }
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
+    if _PO_TOKEN:
+        opts["extractor_args"]["youtube"]["po_token"] = [f"web+{_PO_TOKEN}"]
     return opts
 
 def _search_yt(query: str, n: int = 5) -> list[Track]:
