@@ -116,16 +116,14 @@ def _yt_opts(extra: dict = {}) -> dict:
         "no_warnings": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["web", "android"],
-                "player_skip": ["webpage", "configs"],
+                # TV client ít bị block nhất
+                "player_client": ["tv_embedded", "android", "web"],
             }
         },
         **extra
     }
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
-    if _PO_TOKEN:
-        opts["extractor_args"]["youtube"]["po_token"] = [f"web+{_PO_TOKEN}"]
     return opts
 
 def _search_yt(query: str, n: int = 5) -> list[Track]:
