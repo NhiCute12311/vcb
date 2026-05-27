@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════╗
 ║      Telegram Voice Chat Music Bot  🎵           ║
@@ -15,6 +15,14 @@ Chạy:
 import asyncio
 _loop = asyncio.new_event_loop()
 asyncio.set_event_loop(_loop)
+
+# ── Cài ffmpeg nếu chưa có ───────────────────────
+import subprocess as _sp, shutil as _sh
+if not _sh.which("ffmpeg"):
+    print("[setup] Cài ffmpeg...")
+    _sp.run("apt-get install -y ffmpeg 2>/dev/null || "
+            "apk add ffmpeg 2>/dev/null || "
+            "yum install -y ffmpeg 2>/dev/null || true", shell=True)
 
 import os, re, sys, logging
 from collections import deque
@@ -110,20 +118,34 @@ else:
 # PO Token để bypass YouTube bot check (không cần cookies)
 _PO_TOKEN = ""  # Để trống — dùng cookies thay thế
 
+import shutil as _shutil
+
+def _find_ffmpeg():
+    for cmd in ["ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/nix/store/*/bin/ffmpeg"]:
+        path = _shutil.which(cmd) or (cmd if cmd.startswith("/") and __import__("os").path.exists(cmd) else None)
+        if path:
+            return __import__("os").path.dirname(path)
+    return None
+
+_FFMPEG_LOC = _find_ffmpeg()
+
 def _yt_opts(extra: dict = {}) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
         "extractor_args": {
             "youtube": {
-                # TV client ít bị block nhất
                 "player_client": ["tv_embedded", "android", "web"],
             }
         },
+        # Bỏ qua ffprobe check
+        "check_formats": False,
         **extra
     }
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
+    if _FFMPEG_LOC:
+        opts["ffmpeg_location"] = _FFMPEG_LOC
     return opts
 
 def _search_yt(query: str, n: int = 5) -> list[Track]:
