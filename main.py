@@ -146,7 +146,7 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
 
 def _get_stream_url(track: Track) -> str:
     opts = _yt_opts({
-        "format":      "bestaudio[ext=opus]/bestaudio[ext=m4a]/bestaudio/best",
+        "format":      "bestaudio/best",
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
         },
@@ -162,7 +162,7 @@ def _get_video_urls(track: Track):
     """Trả về URL video chất lượng thấp để giảm lag."""
     opts = {
         # 360p để giảm băng thông — đủ để xem trong VC
-        "format":      "bestvideo[height<=720][ext=mp4]+bestaudio/best[height<=720]/best",
+        "format":      "bestvideo[height<=720]+bestaudio/bestvideo+bestaudio/best",
         "quiet":       True,
         "no_warnings": True,
         "http_headers": {
