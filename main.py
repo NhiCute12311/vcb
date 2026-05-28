@@ -188,7 +188,9 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
 import tempfile, glob
 
 def _get_stream_url(track: Track) -> str:
-    """Lấy URL stream trực tiếp — không download, phát ngay lập tức."""
+    """Lấy URL audio stream — ưu tiên webm/opus, fallback download mp3."""
+    import tempfile, glob as _glob
+
     opts = _yt_opts({
         "check_formats":        False,
         "no_check_certificate": True,
@@ -199,26 +201,41 @@ def _get_stream_url(track: Track) -> str:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(track.url, download=False)
         formats = info.get("formats", [])
-        log.info("Available formats: %d", len(formats))
+        log.info("Formats: %d", len(formats))
+        for f in formats:
+            log.info("  fmt: ext=%s acodec=%s vcodec=%s", f.get("ext"), f.get("acodec"), f.get("vcodec"))
 
-        # 1. Audio only tốt nhất
+        # Chỉ lấy audio-only
         for f in reversed(formats):
             url = f.get("url", "")
-            if url and f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none":
-                log.info("Stream audio-only: ext=%s abr=%s", f.get("ext"), f.get("abr"))
+            acodec = f.get("acodec", "none")
+            vcodec = f.get("vcodec", "none")
+            if url and acodec != "none" and vcodec == "none":
+                log.info("Audio-only found: ext=%s abr=%s", f.get("ext"), f.get("abr"))
                 return url
 
-        # 2. Muxed có audio
-        for f in reversed(formats):
-            url = f.get("url", "")
-            if url and f.get("acodec", "none") != "none":
-                log.info("Stream muxed: ext=%s", f.get("ext"))
-                return url
-
-        if info.get("url"):
-            return info["url"]
-
-    raise Exception("Không có format nào khả dụng")
+    # Không có audio-only → download và extract mp3
+    log.warning("No audio-only stream, downloading mp3...")
+    tmpdir = tempfile.mkdtemp()
+    dl_opts = _yt_opts({
+        "format":      "bestaudio/best",
+        "outtmpl":     os.path.join(tmpdir, "audio.%(ext)s"),
+        "check_formats": False,
+        "postprocessors": [{
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
+            "preferredquality": "128",
+        }],
+    })
+    with yt_dlp.YoutubeDL(dl_opts) as ydl:
+        ydl.download([track.url])
+    files = _glob.glob(os.path.join(tmpdir, "*.mp3"))
+    if not files:
+        files = _glob.glob(os.path.join(tmpdir, "*"))
+    if files:
+        log.info("Downloaded mp3: %s", files[0])
+        return files[0]
+    raise Exception("Không lấy được stream URL")
 
 def _get_video_urls(track: Track):
     """Lấy URL stream video+audio trực tiếp — không download, phát ngay."""
@@ -907,3 +924,4 @@ if __name__ == "__main__":
                 import time; time.sleep(5)
             else:
                 import time; time.sleep(15)
+
