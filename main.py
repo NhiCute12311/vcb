@@ -90,13 +90,14 @@ class Track:
 
 @dataclass
 class GState:
-    queue:    deque           = field(default_factory=deque)
-    current:  Optional[Track] = None
-    loop:     bool            = False
-    volume:   int             = 100
-    paused:   bool            = False
-    np_msg:   int             = 0
-    tmp_file: str             = ""   # file tạm đang stream — xoá sau khi xong
+    queue:      deque           = field(default_factory=deque)
+    current:    Optional[Track] = None
+    loop:       bool            = False
+    volume:     int             = 100
+    paused:     bool            = False
+    np_msg:     int             = 0
+    tmp_file:   str             = ""
+    is_playing: bool            = False  # True sau khi calls.play() thành công
 
 _states: dict[int, GState] = {}
 
@@ -355,7 +356,8 @@ async def _play_next(client: Client, cid: int):
         track = g.queue.popleft()
     else:
         # Hết bài → thoát VC
-        g.current = None
+        g.current    = None
+        g.is_playing = False
         if g.np_msg:
             try:
                 await client.delete_messages(cid, g.np_msg)
@@ -472,12 +474,13 @@ async def _on_update(_, update):
 
     if should_next:
         g = st(cid)
-        # Đảm bảo đang có bài phát mới trigger next
-        if g.current:
+        # Chỉ trigger khi đang thật sự phát nhạc
+        if g.current and g.is_playing:
+            g.is_playing = False
             log.info("Stream ended → next track in %d", cid)
             await _play_next(bot, cid)
         else:
-            log.info("Stream ended but no current track, ignoring")
+            log.info("StreamEnded ignored (is_playing=%s, current=%s)", g.is_playing, g.current)
 
 # ══════════════════════════════════════════════════
 #  Search result cache + keyboard
@@ -910,4 +913,3 @@ if __name__ == "__main__":
                 import time; time.sleep(5)
             else:
                 import time; time.sleep(15)
-
