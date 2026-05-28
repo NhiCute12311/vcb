@@ -186,9 +186,9 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
 
 def _get_stream_url(track: Track) -> str:
     opts = _yt_opts({
-        "check_formats":       False,
+        "check_formats":        False,
         "no_check_certificate": True,
-        "skip_download":       True,
+        "skip_download":        True,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
         },
@@ -197,19 +197,28 @@ def _get_stream_url(track: Track) -> str:
         info = ydl.extract_info(track.url, download=False)
         formats = info.get("formats", [])
         log.info("Available formats: %d", len(formats))
-        # Ưu tiên audio only
+
+        # 1. Audio only (tốt nhất)
         for f in reversed(formats):
             url = f.get("url", "")
             if url and f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none":
-                log.info("Using audio: ext=%s abr=%s", f.get("ext"), f.get("abr"))
+                log.info("Using audio-only: ext=%s abr=%s", f.get("ext"), f.get("abr"))
                 return url
-        # Fallback: bất kỳ format nào có URL
+
+        # 2. Format có cả audio+video — py-tgcalls sẽ tự extract audio
         for f in reversed(formats):
-            if f.get("url"):
-                log.info("Fallback: ext=%s", f.get("ext"))
-                return f["url"]
+            url = f.get("url", "")
+            if url and f.get("acodec", "none") != "none":
+                log.info("Using muxed: ext=%s", f.get("ext"))
+                return url
+
+        # 3. Cuối cùng dùng bất kỳ URL nào
         if info.get("url"):
             return info["url"]
+        for f in reversed(formats):
+            if f.get("url"):
+                return f["url"]
+
     raise Exception("Không có format nào khả dụng")
 
 def _get_video_urls(track: Track):
@@ -616,8 +625,10 @@ async def cmd_volume(client: Client, msg: Message):
     g.volume = vol
     try:
         await calls.change_volume_call(msg.chat.id, vol)
+        log.info("Volume set to %d in %d", vol, msg.chat.id)
     except Exception as ve:
-        log.warning("set_volume error: %s", ve)
+        log.warning("volume error: %s", ve)
+        await msg.reply(f"⚠️ Không chỉnh được volume: {ve}")
     await msg.reply(f"🔊 Âm lượng: **{vol}%**")
     await _update_np(client, msg.chat.id)
 
@@ -736,7 +747,7 @@ async def on_cb(client: Client, cb: CallbackQuery):
         try:
             await calls.change_volume_call(cid, g.volume)
         except Exception as ve:
-            log.warning("vol up error: %s", ve)
+            log.warning("vol+ error: %s", ve)
         await cb.answer(f"🔊 {g.volume}%")
         await _update_np(client, cid)
         return
@@ -746,7 +757,7 @@ async def on_cb(client: Client, cb: CallbackQuery):
         try:
             await calls.change_volume_call(cid, g.volume)
         except Exception as ve:
-            log.warning("vol down error: %s", ve)
+            log.warning("vol- error: %s", ve)
         await cb.answer(f"🔉 {g.volume}%")
         await _update_np(client, cid)
         return
@@ -824,4 +835,3 @@ if __name__ == "__main__":
         except Exception as e:
             log.error("Bot crashed: %s — restarting in 15s...", e)
             import time; time.sleep(15)
-
