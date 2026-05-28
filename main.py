@@ -188,38 +188,12 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
 import tempfile, glob
 
 def _get_stream_url(track: Track) -> str:
-    """Lấy URL audio stream — ưu tiên webm/opus, fallback download mp3."""
+    """Download audio về file mp3 rồi stream — tránh URL expire 403."""
     import tempfile, glob as _glob
-
-    opts = _yt_opts({
-        "check_formats":        False,
-        "no_check_certificate": True,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
-        },
-    })
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(track.url, download=False)
-        formats = info.get("formats", [])
-        log.info("Formats: %d", len(formats))
-        for f in formats:
-            log.info("  fmt: ext=%s acodec=%s vcodec=%s", f.get("ext"), f.get("acodec"), f.get("vcodec"))
-
-        # Chỉ lấy audio-only
-        for f in reversed(formats):
-            url = f.get("url", "")
-            acodec = f.get("acodec", "none")
-            vcodec = f.get("vcodec", "none")
-            if url and acodec != "none" and vcodec == "none":
-                log.info("Audio-only found: ext=%s abr=%s", f.get("ext"), f.get("abr"))
-                return url
-
-    # Không có audio-only → download và extract mp3
-    log.warning("No audio-only stream, downloading mp3...")
     tmpdir = tempfile.mkdtemp()
     dl_opts = _yt_opts({
-        "format":      "bestaudio/best",
-        "outtmpl":     os.path.join(tmpdir, "audio.%(ext)s"),
+        "format":        "bestaudio/best",
+        "outtmpl":       os.path.join(tmpdir, "audio.%(ext)s"),
         "check_formats": False,
         "postprocessors": [{
             "key":              "FFmpegExtractAudio",
@@ -231,11 +205,11 @@ def _get_stream_url(track: Track) -> str:
         ydl.download([track.url])
     files = _glob.glob(os.path.join(tmpdir, "*.mp3"))
     if not files:
-        files = _glob.glob(os.path.join(tmpdir, "*"))
-    if files:
-        log.info("Downloaded mp3: %s", files[0])
-        return files[0]
-    raise Exception("Không lấy được stream URL")
+        files = _glob.glob(os.path.join(tmpdir, "*.*"))
+    if not files:
+        raise Exception("Không tải được file audio")
+    log.info("Downloaded: %s (%.1fMB)", os.path.basename(files[0]), os.path.getsize(files[0])/1024/1024)
+    return files[0]
 
 def _get_video_urls(track: Track):
     """Lấy URL stream video+audio trực tiếp — không download, phát ngay."""
@@ -403,8 +377,18 @@ async def _play_next(client: Client, cid: int):
         await client.send_message(cid, "✅ Hết nhạc. Userbot đã thoát VC.")
         return
 
+    # Xoá file tạm bài trước
+    prev_tmp = getattr(st(cid), "_tmp_file", "")
+    if prev_tmp and os.path.isfile(prev_tmp):
+        try:
+            import shutil
+            shutil.rmtree(os.path.dirname(prev_tmp), ignore_errors=True)
+        except Exception:
+            pass
+
     g.current = track
     g.paused  = False
+    g._tmp_file = ""
 
     try:
         if track.is_video:
