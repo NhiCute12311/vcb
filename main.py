@@ -386,19 +386,30 @@ async def _play_next(client: Client, cid: int):
                 except Exception:
                     ms = MediaStream(video_url)
         else:
-            stream_url = await asyncio.get_event_loop().run_in_executor(
-                None, _get_stream_url, track
-            )
-            # Dùng ffmpeg để extract audio — hoạt động với cả mp4 lẫn webm/opus
+            # Tải file trong khi giữ kết nối bằng keepalive
+            async def _keepalive():
+                while True:
+                    try:
+                        await userbot.invoke(
+                            __import__("pyrogram.raw.functions.updates", fromlist=["GetState"]).GetState()
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(20)
+
+            ka_task = asyncio.create_task(_keepalive())
+            try:
+                stream_url = await asyncio.get_event_loop().run_in_executor(
+                    None, _get_stream_url, track
+                )
+            finally:
+                ka_task.cancel()
+
             try:
                 from pytgcalls.types import AudioQuality
-                ms = MediaStream(
-                    stream_url,
-                    audio_parameters=AudioQuality.HIGH,
-                )
+                ms = MediaStream(stream_url, audio_parameters=AudioQuality.HIGH)
             except Exception:
                 ms = MediaStream(stream_url)
-            # Lưu đường dẫn file tạm để xoá sau
             if os.path.isfile(stream_url):
                 g.tmp_file = stream_url
 
