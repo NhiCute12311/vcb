@@ -79,13 +79,14 @@ BOT_TOKEN = "8254987879:AAGCLxCes79aDF6rGsZl1L4oPZUfTqj7uw0"
 # ══════════════════════════════════════════════════
 @dataclass
 class Track:
-    title:     str
-    url:       str
-    duration:  int
-    thumbnail: str  = ""
-    requester: str  = ""
-    source:    str  = "yt"
-    is_video:  bool = False
+    title:        str
+    url:          str
+    duration:     int
+    thumbnail:    str  = ""
+    requester:    str  = ""
+    requester_id: int  = 0     # user_id của người yêu cầu
+    source:       str  = "yt"
+    is_video:     bool = False
 
 @dataclass
 class GState:
@@ -465,7 +466,8 @@ async def cmd_play(client: Client, msg: Message):
         await msg.reply("❓ Dùng: /play <tên bài hoặc link YouTube>")
         return
     s = await msg.reply(f"🔍 Đang tìm **{q}** trên YouTube…")
-    requester = msg.from_user.first_name if msg.from_user else "?"
+    requester    = msg.from_user.first_name if msg.from_user else "?"
+    requester_id = msg.from_user.id if msg.from_user else 0
     try:
         tracks = await asyncio.get_event_loop().run_in_executor(None, _search_yt, q, 5)
     except Exception as e:
@@ -475,7 +477,8 @@ async def cmd_play(client: Client, msg: Message):
         await s.edit("😔 Không tìm thấy kết quả.")
         return
     for t in tracks:
-        t.requester = requester
+        t.requester    = requester
+        t.requester_id = requester_id
     await s.delete()
     m = await msg.reply(f"🎵 **{q}** — chọn bài:", reply_markup=_search_kb(tracks, "yt"))
     _cache[m.id] = tracks
@@ -487,7 +490,8 @@ async def cmd_video(client: Client, msg: Message):
         await msg.reply("❓ Dùng: /video <tên video hoặc link YouTube>")
         return
     s = await msg.reply(f"🔍 Đang tìm video **{q}**…")
-    requester = msg.from_user.first_name if msg.from_user else "?"
+    requester    = msg.from_user.first_name if msg.from_user else "?"
+    requester_id = msg.from_user.id if msg.from_user else 0
     try:
         tracks = await asyncio.get_event_loop().run_in_executor(None, _search_yt, q, 5)
     except Exception as e:
@@ -497,8 +501,9 @@ async def cmd_video(client: Client, msg: Message):
         await s.edit("😔 Không tìm thấy kết quả.")
         return
     for t in tracks:
-        t.requester = requester
-        t.is_video  = True   # đánh dấu là video
+        t.requester    = requester
+        t.requester_id = requester_id
+        t.is_video     = True
     await s.delete()
     m = await msg.reply(f"🎬 **{q}** — chọn video:", reply_markup=_search_kb(tracks, "yt"))
     _cache[m.id] = tracks
@@ -509,6 +514,14 @@ async def cmd_skip(client: Client, msg: Message):
     if not g.current:
         await msg.reply("❌ Không có bài nào đang phát.")
         return
+
+    user_id = msg.from_user.id if msg.from_user else 0
+
+    # Chỉ người yêu cầu bài mới được skip
+    if g.current.requester_id != user_id:
+        await msg.reply(f"❌ Chỉ **{g.current.requester}** (người yêu cầu) mới được skip bài này!")
+        return
+
     title  = g.current.title
     g.loop = False
     g.current = None
@@ -673,6 +686,15 @@ async def on_cb(client: Client, cb: CallbackQuery):
         if not g.current:
             await cb.answer("Không có bài nào đang phát")
             return
+
+        user_id = cb.from_user.id
+        if g.current.requester_id != user_id:
+            await cb.answer(
+                f"❌ Chỉ {g.current.requester} mới được skip!",
+                show_alert=True
+            )
+            return
+
         await cb.answer(f"⏭ {g.current.title[:20]}")
         g.loop = False
         try:
