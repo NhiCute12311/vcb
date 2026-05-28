@@ -135,22 +135,15 @@ def _yt_opts(extra: dict = {}) -> dict:
     opts = {
         "quiet":        True,
         "no_warnings":  True,
-        "check_formats": False,
         "extractor_args": {
             "youtube": {
-                # Thử nhiều client — nếu 1 bị block thì dùng cái khác
-                "player_client": ["tv_embedded", "android_music", "android", "web_creator", "web"],
-                "player_skip":   ["webpage"],
+                "player_client": ["android", "web"],
             }
         },
         **extra
     }
     if _COOKIES_FILE:
         opts["cookiefile"] = _COOKIES_FILE
-    # Dùng OAuth token nếu có
-    if os.path.exists("oauth_token.json"):
-        opts["username"] = "oauth2"
-        opts["password"] = ""
     if _FFMPEG_LOC:
         opts["ffmpeg_location"] = _FFMPEG_LOC
     return opts
