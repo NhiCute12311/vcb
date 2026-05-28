@@ -274,12 +274,25 @@ def _fmt(s: int) -> str:
 #  - userbot: dùng API_ID/HASH của bạn → join VC
 #  - bot: dùng BOT_TOKEN → nhận lệnh từ user
 # ══════════════════════════════════════════════════
-userbot = Client(
-    "vcbot_userbot",        # lưu session vào file vcbot_userbot.session
-    api_id=API_ID,
-    api_hash=API_HASH,
-    sleep_threshold=60,
-)
+# Dùng session string thay vì file — hoạt động trên Railway
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+
+if SESSION_STRING:
+    userbot = Client(
+        "vcbot_userbot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=SESSION_STRING,
+        sleep_threshold=60,
+    )
+else:
+    # Fallback: dùng file session (chạy local)
+    userbot = Client(
+        "vcbot_userbot",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        sleep_threshold=60,
+    )
 bot = Client(
     "vcbot_bot",
     api_id=API_ID,
@@ -668,11 +681,26 @@ async def cmd_clear(_, msg: Message):
     g = st(msg.chat.id)
     n = len(g.queue)
     g.queue.clear()
-    await msg.reply(f"🗑 Đã xoá **{n}** bài khỏi hàng chờ.")
+    await msg.reply(f"Xoa {n} bai khoi hang cho.")
 
-# ══════════════════════════════════════════════════
-#  Callback query handler
-# ══════════════════════════════════════════════════
+@app.on_message(filters.command("updatecookies"))
+async def cmd_update_cookies(client: Client, msg: Message):
+    if not msg.document:
+        await msg.reply("Gui file cookies.txt kem lenh /updatecookies de cap nhat khi YouTube bi block.")
+        return
+    if not msg.document.file_name.endswith(".txt"):
+        await msg.reply("File phai la .txt")
+        return
+    s = await msg.reply("Dang cap nhat cookies...")
+    try:
+        await client.download_media(msg.document, file_name="cookies.txt")
+        global _COOKIES_FILE
+        _COOKIES_FILE = "cookies.txt"
+        log.info("Cookies updated")
+        await s.edit("Cookies da cap nhat! YouTube se hoat dong tro lai.")
+    except Exception as e:
+        await s.edit(f"Loi: {e}")
+
 @app.on_callback_query()
 async def on_cb(client: Client, cb: CallbackQuery):
     data = cb.data
