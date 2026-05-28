@@ -400,9 +400,20 @@ async def _play_next(client: Client, cid: int):
 
             try:
                 from pytgcalls.types import AudioQuality
-                ms = MediaStream(stream_url, audio_parameters=AudioQuality.HIGH)
+                from pytgcalls.types import MediaStream as MS
+                ms = MS(
+                    stream_url,
+                    audio_parameters=AudioQuality.HIGH,
+                    ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                )
             except Exception:
-                ms = MediaStream(stream_url)
+                try:
+                    ms = MediaStream(
+                        stream_url,
+                        ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                    )
+                except Exception:
+                    ms = MediaStream(stream_url)
 
 
         await calls.play(cid, ms)
