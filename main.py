@@ -218,32 +218,32 @@ def _get_stream_url(track: Track) -> str:
     return files[0]
 
 def _get_video_urls(track: Track):
-    """Trả về URL video chất lượng thấp để giảm lag."""
-    opts = {
-        # 360p để giảm băng thông — đủ để xem trong VC
-        "format":      "bestvideo[height<=720]+bestaudio/bestvideo+bestaudio/best",
-        "quiet":       True,
-        "no_warnings": True,
+    """Download video+audio rồi merge thành 1 file mp4 — stream mượt hơn URL trực tiếp."""
+    import tempfile, glob
+    tmpdir = tempfile.mkdtemp()
+    opts = _yt_opts({
+        "format":      "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
+        "outtmpl":     os.path.join(tmpdir, "video.%(ext)s"),
+        "check_formats": False,
+        "no_check_certificate": True,
+        "merge_output_format": "mp4",
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
         },
-    }
+    })
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(track.url, download=False)
-        formats = info.get("formats", [])
-        audio_url = None
-        video_url = None
-        for f in reversed(formats):
-            if f.get("acodec") != "none" and f.get("vcodec") == "none" and not audio_url:
-                audio_url = f["url"]
-            if f.get("vcodec") != "none" and f.get("acodec") == "none" and not video_url:
-                video_url = f["url"]
-            if audio_url and video_url:
-                break
-        if not audio_url or not video_url:
-            url = info.get("url") or formats[-1]["url"]
-            return url, url
-        return audio_url, video_url
+        ydl.download([track.url])
+
+    files = glob.glob(os.path.join(tmpdir, "*.mp4"))
+    if not files:
+        files = glob.glob(os.path.join(tmpdir, "*"))
+    if not files:
+        raise Exception("Không tải được file video")
+
+    file_path = files[0]
+    log.info("Video downloaded: %s (%.1f MB)", os.path.basename(file_path), os.path.getsize(file_path)/1024/1024)
+    # Trả về cùng 1 file cho cả audio và video — MediaStream tự tách
+    return file_path, file_path
 
 def _fmt(s: int) -> str:
     if s <= 0: return "?"
