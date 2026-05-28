@@ -90,12 +90,13 @@ class Track:
 
 @dataclass
 class GState:
-    queue:   deque           = field(default_factory=deque)
-    current: Optional[Track] = None
-    loop:    bool            = False
-    volume:  int             = 100
-    paused:  bool            = False
-    np_msg:  int             = 0     # message_id của card "Now Playing"
+    queue:    deque           = field(default_factory=deque)
+    current:  Optional[Track] = None
+    loop:     bool            = False
+    volume:   int             = 100
+    paused:   bool            = False
+    np_msg:   int             = 0
+    tmp_file: str             = ""   # file tạm đang stream — xoá sau khi xong
 
 _states: dict[int, GState] = {}
 
@@ -184,42 +185,37 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
         for e in (res.get("entries") or [])[:n] if e
     ]
 
+import tempfile, glob
+
 def _get_stream_url(track: Track) -> str:
+    """Tải file audio xuống rồi trả về đường dẫn file — đảm bảo phát được."""
+    tmpdir = tempfile.mkdtemp()
     opts = _yt_opts({
+        "format":               "bestaudio/best",
+        "outtmpl":              os.path.join(tmpdir, "audio.%(ext)s"),
         "check_formats":        False,
         "no_check_certificate": True,
-        "skip_download":        True,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
         },
+        # Extract audio bằng ffmpeg
+        "postprocessors": [{
+            "key":              "FFmpegExtractAudio",
+            "preferredcodec":   "mp3",
+            "preferredquality": "192",
+        }],
     })
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(track.url, download=False)
-        formats = info.get("formats", [])
-        log.info("Available formats: %d", len(formats))
-
-        # 1. Audio only (tốt nhất)
-        for f in reversed(formats):
-            url = f.get("url", "")
-            if url and f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none":
-                log.info("Using audio-only: ext=%s abr=%s", f.get("ext"), f.get("abr"))
-                return url
-
-        # 2. Format có cả audio+video — py-tgcalls sẽ tự extract audio
-        for f in reversed(formats):
-            url = f.get("url", "")
-            if url and f.get("acodec", "none") != "none":
-                log.info("Using muxed: ext=%s", f.get("ext"))
-                return url
-
-        # 3. Cuối cùng dùng bất kỳ URL nào
-        if info.get("url"):
-            return info["url"]
-        for f in reversed(formats):
-            if f.get("url"):
-                return f["url"]
-
-    raise Exception("Không có format nào khả dụng")
+        ydl.download([track.url])
+    
+    files = glob.glob(os.path.join(tmpdir, "*.mp3"))
+    if not files:
+        files = glob.glob(os.path.join(tmpdir, "*"))
+    if not files:
+        raise Exception("Không tải được file audio")
+    
+    log.info("Downloaded: %s (%.1f MB)", os.path.basename(files[0]), os.path.getsize(files[0])/1024/1024)
+    return files[0]
 
 def _get_video_urls(track: Track):
     """Trả về URL video chất lượng thấp để giảm lag."""
@@ -359,6 +355,16 @@ async def _play_next(client: Client, cid: int):
         await client.send_message(cid, "✅ Hết nhạc. Userbot đã thoát VC.")
         return
 
+    # Xoá file tạm của bài trước
+    if g.tmp_file and os.path.isfile(g.tmp_file):
+        try:
+            tmpdir = os.path.dirname(g.tmp_file)
+            os.remove(g.tmp_file)
+            os.rmdir(tmpdir)
+        except Exception:
+            pass
+        g.tmp_file = ""
+
     g.current = track
     g.paused  = False
 
@@ -383,7 +389,18 @@ async def _play_next(client: Client, cid: int):
             stream_url = await asyncio.get_event_loop().run_in_executor(
                 None, _get_stream_url, track
             )
-            ms = MediaStream(stream_url, audio_parameters=_HQ_AUDIO) if _HQ_AUDIO else MediaStream(stream_url)
+            # Dùng ffmpeg để extract audio — hoạt động với cả mp4 lẫn webm/opus
+            try:
+                from pytgcalls.types import AudioQuality
+                ms = MediaStream(
+                    stream_url,
+                    audio_parameters=AudioQuality.HIGH,
+                )
+            except Exception:
+                ms = MediaStream(stream_url)
+            # Lưu đường dẫn file tạm để xoá sau
+            if os.path.isfile(stream_url):
+                g.tmp_file = stream_url
 
         await calls.play(cid, ms)
         await _send_np(client, cid, track)
@@ -835,3 +852,4 @@ if __name__ == "__main__":
         except Exception as e:
             log.error("Bot crashed: %s — restarting in 15s...", e)
             import time; time.sleep(15)
+
