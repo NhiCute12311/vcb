@@ -458,24 +458,33 @@ async def _on_update(_, update):
         return
 
     cls = type(update).__name__
-
-    # Bỏ qua participant updates — không phải stream end
-    if "Participant" in cls or "Member" in cls:
-        return
-
     log.info("VC update: %s in %d", cls, cid)
 
+    # CHỈ trigger khi stream thật sự kết thúc
+    # Bỏ qua TẤT CẢ các update khác
     should_next = False
+
     if _HAS_STREAM_EVENTS:
-        if isinstance(update, (StreamAudioEnded, StreamVideoEnded)):
+        # Dùng isinstance chính xác nhất
+        if isinstance(update, StreamAudioEnded):
             should_next = True
-    # Kiểm tra theo tên class cho mọi version
-    if "End" in cls or "Ended" in cls or "Finish" in cls or "Complete" in cls or "Stopped" in cls:
-        should_next = True
+            log.info("StreamAudioEnded detected")
+        elif isinstance(update, StreamVideoEnded):
+            should_next = True
+            log.info("StreamVideoEnded detected")
+    else:
+        # Chỉ match đúng class name — tránh false positive
+        if cls in ("StreamAudioEnded", "StreamVideoEnded", "StreamEnded"):
+            should_next = True
 
     if should_next:
-        log.info("Stream ended in %d → next track", cid)
-        await _play_next(bot, cid)
+        g = st(cid)
+        # Đảm bảo đang có bài phát mới trigger next
+        if g.current:
+            log.info("Stream ended → next track in %d", cid)
+            await _play_next(bot, cid)
+        else:
+            log.info("Stream ended but no current track, ignoring")
 
 # ══════════════════════════════════════════════════
 #  Search result cache + keyboard
