@@ -218,32 +218,44 @@ def _get_stream_url(track: Track) -> str:
     return files[0]
 
 def _get_video_urls(track: Track):
-    """Download video+audio rồi merge thành 1 file mp4 — stream mượt hơn URL trực tiếp."""
-    import tempfile, glob
-    tmpdir = tempfile.mkdtemp()
+    """Lấy URL stream video+audio trực tiếp — không download."""
     opts = _yt_opts({
-        "format":      "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "outtmpl":     os.path.join(tmpdir, "video.%(ext)s"),
-        "check_formats": False,
+        "check_formats":        False,
         "no_check_certificate": True,
-        "merge_output_format": "mp4",
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
         },
     })
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([track.url])
-
-    files = glob.glob(os.path.join(tmpdir, "*.mp4"))
-    if not files:
-        files = glob.glob(os.path.join(tmpdir, "*"))
-    if not files:
-        raise Exception("Không tải được file video")
-
-    file_path = files[0]
-    log.info("Video downloaded: %s (%.1f MB)", os.path.basename(file_path), os.path.getsize(file_path)/1024/1024)
-    # Trả về cùng 1 file cho cả audio và video — MediaStream tự tách
-    return file_path, file_path
+        info = ydl.extract_info(track.url, download=False)
+        formats = info.get("formats", [])
+        audio_url = None
+        video_url = None
+        # Tìm video 480p để giảm lag (không cần 720p)
+        for f in formats:
+            h = f.get("height") or 0
+            if f.get("vcodec", "none") != "none" and f.get("acodec", "none") == "none":
+                if 360 <= h <= 480 and not video_url:
+                    video_url = f["url"]
+            if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none":
+                if not audio_url:
+                    audio_url = f["url"]
+        # Fallback
+        if not video_url:
+            for f in reversed(formats):
+                if f.get("vcodec", "none") != "none" and f.get("url"):
+                    video_url = f["url"]
+                    break
+        if not audio_url:
+            for f in reversed(formats):
+                if f.get("acodec", "none") != "none" and f.get("url"):
+                    audio_url = f["url"]
+                    break
+        if not video_url or not audio_url:
+            url = info.get("url") or formats[-1]["url"]
+            return url, url
+        log.info("Video stream: video=%s audio=%s", video_url[:50], audio_url[:50])
+        return audio_url, video_url
 
 def _fmt(s: int) -> str:
     if s <= 0: return "?"
@@ -863,4 +875,3 @@ if __name__ == "__main__":
         except Exception as e:
             log.error("Bot crashed: %s — restarting in 15s...", e)
             import time; time.sleep(15)
-
