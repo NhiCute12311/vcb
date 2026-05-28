@@ -188,37 +188,40 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
 import tempfile, glob
 
 def _get_stream_url(track: Track) -> str:
-    """Tải file audio xuống rồi trả về đường dẫn file — đảm bảo phát được."""
-    tmpdir = tempfile.mkdtemp()
+    """Lấy URL stream trực tiếp — không download, phát ngay lập tức."""
     opts = _yt_opts({
-        "format":               "bestaudio/best",
-        "outtmpl":              os.path.join(tmpdir, "audio.%(ext)s"),
         "check_formats":        False,
         "no_check_certificate": True,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
         },
-        # Extract audio bằng ffmpeg
-        "postprocessors": [{
-            "key":              "FFmpegExtractAudio",
-            "preferredcodec":   "mp3",
-            "preferredquality": "192",
-        }],
     })
     with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([track.url])
-    
-    files = glob.glob(os.path.join(tmpdir, "*.mp3"))
-    if not files:
-        files = glob.glob(os.path.join(tmpdir, "*"))
-    if not files:
-        raise Exception("Không tải được file audio")
-    
-    log.info("Downloaded: %s (%.1f MB)", os.path.basename(files[0]), os.path.getsize(files[0])/1024/1024)
-    return files[0]
+        info = ydl.extract_info(track.url, download=False)
+        formats = info.get("formats", [])
+        log.info("Available formats: %d", len(formats))
+
+        # 1. Audio only tốt nhất
+        for f in reversed(formats):
+            url = f.get("url", "")
+            if url and f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none":
+                log.info("Stream audio-only: ext=%s abr=%s", f.get("ext"), f.get("abr"))
+                return url
+
+        # 2. Muxed có audio
+        for f in reversed(formats):
+            url = f.get("url", "")
+            if url and f.get("acodec", "none") != "none":
+                log.info("Stream muxed: ext=%s", f.get("ext"))
+                return url
+
+        if info.get("url"):
+            return info["url"]
+
+    raise Exception("Không có format nào khả dụng")
 
 def _get_video_urls(track: Track):
-    """Lấy URL stream video+audio trực tiếp — không download."""
+    """Lấy URL stream video+audio trực tiếp — không download, phát ngay."""
     opts = _yt_opts({
         "check_formats":        False,
         "no_check_certificate": True,
@@ -231,21 +234,24 @@ def _get_video_urls(track: Track):
         formats = info.get("formats", [])
         audio_url = None
         video_url = None
-        # Tìm video 480p để giảm lag (không cần 720p)
+        # Audio only
+        for f in reversed(formats):
+            if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none" and f.get("url"):
+                audio_url = f["url"]
+                break
+        # Video only 480p
         for f in formats:
             h = f.get("height") or 0
-            if f.get("vcodec", "none") != "none" and f.get("acodec", "none") == "none":
-                if 360 <= h <= 480 and not video_url:
-                    video_url = f["url"]
-            if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none":
-                if not audio_url:
-                    audio_url = f["url"]
-        # Fallback
+            if f.get("vcodec", "none") != "none" and f.get("acodec", "none") == "none" and 360 <= h <= 480 and f.get("url"):
+                video_url = f["url"]
+                break
+        # Fallback video
         if not video_url:
             for f in reversed(formats):
                 if f.get("vcodec", "none") != "none" and f.get("url"):
                     video_url = f["url"]
                     break
+        # Fallback audio
         if not audio_url:
             for f in reversed(formats):
                 if f.get("acodec", "none") != "none" and f.get("url"):
@@ -254,7 +260,7 @@ def _get_video_urls(track: Track):
         if not video_url or not audio_url:
             url = info.get("url") or formats[-1]["url"]
             return url, url
-        log.info("Video stream: video=%s audio=%s", video_url[:50], audio_url[:50])
+        log.info("Video: %s | Audio: %s", video_url[:60], audio_url[:60])
         return audio_url, video_url
 
 def _fmt(s: int) -> str:
@@ -367,16 +373,6 @@ async def _play_next(client: Client, cid: int):
         await client.send_message(cid, "✅ Hết nhạc. Userbot đã thoát VC.")
         return
 
-    # Xoá file tạm của bài trước
-    if g.tmp_file and os.path.isfile(g.tmp_file):
-        try:
-            tmpdir = os.path.dirname(g.tmp_file)
-            os.remove(g.tmp_file)
-            os.rmdir(tmpdir)
-        except Exception:
-            pass
-        g.tmp_file = ""
-
     g.current = track
     g.paused  = False
 
@@ -398,32 +394,16 @@ async def _play_next(client: Client, cid: int):
                 except Exception:
                     ms = MediaStream(video_url)
         else:
-            # Tải file trong khi giữ kết nối bằng keepalive
-            async def _keepalive():
-                while True:
-                    try:
-                        await userbot.invoke(
-                            __import__("pyrogram.raw.functions.updates", fromlist=["GetState"]).GetState()
-                        )
-                    except Exception:
-                        pass
-                    await asyncio.sleep(20)
-
-            ka_task = asyncio.create_task(_keepalive())
-            try:
-                stream_url = await asyncio.get_event_loop().run_in_executor(
-                    None, _get_stream_url, track
-                )
-            finally:
-                ka_task.cancel()
+            stream_url = await asyncio.get_event_loop().run_in_executor(
+                None, _get_stream_url, track
+            )
 
             try:
                 from pytgcalls.types import AudioQuality
                 ms = MediaStream(stream_url, audio_parameters=AudioQuality.HIGH)
             except Exception:
                 ms = MediaStream(stream_url)
-            if os.path.isfile(stream_url):
-                g.tmp_file = stream_url
+
 
         await calls.play(cid, ms)
         await _send_np(client, cid, track)
@@ -875,3 +855,4 @@ if __name__ == "__main__":
         except Exception as e:
             log.error("Bot crashed: %s — restarting in 15s...", e)
             import time; time.sleep(15)
+
