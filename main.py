@@ -864,6 +864,18 @@ if __name__ == "__main__":
             log.info("Bot dừng bởi người dùng.")
             break
         except Exception as e:
+            err = str(e)
             log.error("Bot crashed: %s — restarting in 15s...", e)
-            import time; time.sleep(15)
-
+            # Xoá session nếu bị AUTH_KEY_DUPLICATED
+            if "AUTH_KEY_DUPLICATED" in err or "auth_key" in err.lower():
+                log.warning("AUTH_KEY_DUPLICATED — xoá session và đăng nhập lại...")
+                for f in ["vcbot_userbot.session", "vcbot_userbot.session-journal",
+                          "vcbot_bot.session", "vcbot_bot.session-journal"]:
+                    try:
+                        os.remove(f)
+                        log.info("Đã xoá: %s", f)
+                    except Exception:
+                        pass
+                import time; time.sleep(5)
+            else:
+                import time; time.sleep(15)
