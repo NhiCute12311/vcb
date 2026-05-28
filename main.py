@@ -745,38 +745,61 @@ async def on_cb(client: Client, cb: CallbackQuery):
 # ══════════════════════════════════════════════════
 #  Main
 # ══════════════════════════════════════════════════
-async def main():
-    log.info("Đang khởi động Voice Chat Bot…")
-    # Khởi động userbot (lần đầu sẽ hỏi số điện thoại + OTP)
+async def _start():
+    """Khởi động tất cả clients."""
     log.info("Đang đăng nhập userbot...")
-    await userbot.start()
+    if not userbot.is_connected:
+        await userbot.start()
     ub_me = await userbot.get_me()
     log.info("✅ Userbot: %s (@%s)", ub_me.first_name, ub_me.username or "no username")
 
-    # Khởi động bot — xử lý FloodWait
     for attempt in range(5):
         try:
-            await bot.start()
+            if not bot.is_connected:
+                await bot.start()
             break
         except Exception as e:
             err = str(e)
             if "FLOOD_WAIT" in err:
                 import re as _re
-                wait = int(_re.search(r"wait of (\d+)", err).group(1)) if _re.search(r"wait of (\d+)", err) else 60
+                m = _re.search(r"wait of (\d+)", err)
+                wait = int(m.group(1)) if m else 60
                 log.warning("FloodWait: chờ %d giây...", wait)
                 await asyncio.sleep(min(wait, 300))
             else:
                 raise
+
     bot_me = await bot.get_me()
     log.info("✅ Bot: @%s", bot_me.username)
-
-    # Khởi động PyTgCalls với userbot
     await calls.start()
     log.info("✅ PyTgCalls sẵn sàng — Bot đang chạy!")
-    await idle()
 
-    await userbot.stop()
-    await bot.stop()
+async def main():
+    log.info("Đang khởi động Voice Chat Bot…")
+    await _start()
+
+    # Keepalive loop — tự reconnect khi mất kết nối
+    while True:
+        try:
+            await idle()
+        except Exception as e:
+            log.error("Connection lost: %s — reconnecting in 10s...", e)
+            await asyncio.sleep(10)
+            try:
+                await _start()
+                log.info("✅ Reconnected!")
+            except Exception as re_err:
+                log.error("Reconnect failed: %s — retry in 30s...", re_err)
+                await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    _loop.run_until_complete(main())
+    while True:
+        try:
+            _loop.run_until_complete(main())
+        except KeyboardInterrupt:
+            log.info("Bot dừng bởi người dùng.")
+            break
+        except Exception as e:
+            log.error("Bot crashed: %s — restarting in 15s...", e)
+            import time; time.sleep(15)
+
