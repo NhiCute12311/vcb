@@ -427,9 +427,9 @@ async def _play_next(client: Client, cid: int):
 
 
         import time as _time
-        g._play_start = _time.time()  # Lưu thời điểm bắt đầu play
+        g._play_start = _time.time()
+        g.is_playing  = True   # Set TRƯỚC khi play
         await calls.play(cid, ms)
-        g.is_playing = True
         log.info("calls.play OK")
         await _send_np(client, cid, track)
         log.info("▶ Playing%s: %s [chat=%d]", " [VIDEO]" if track.is_video else "", track.title, cid)
@@ -483,7 +483,7 @@ async def _on_update(_, update):
         elapsed = _time.time() - getattr(g, "_play_start", 0)
         log.info("StreamEnded: is_playing=%s elapsed=%.1fs", g.is_playing, elapsed)
         # Bỏ qua nếu mới play < 3 giây (StreamEnded giả)
-        if g.current and g.is_playing and elapsed > 3:
+        if g.current and g.is_playing and elapsed > 5:
             g.is_playing = False
             log.info("Stream ended → next track in %d", cid)
             await _play_next(bot, cid)
