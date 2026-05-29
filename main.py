@@ -183,28 +183,27 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
 import tempfile, glob
 
 def _get_stream_url(track: Track) -> str:
-    """Download audio về file mp3 rồi stream — tránh URL expire 403."""
-    import tempfile, glob as _glob
-    tmpdir = tempfile.mkdtemp()
-    dl_opts = _yt_opts({
+    """Lấy direct stream URL từ yt-dlp."""
+    opts = _yt_opts({
         "format":        "bestaudio/best",
-        "outtmpl":       os.path.join(tmpdir, "audio.%(ext)s"),
         "check_formats": False,
-        "postprocessors": [{
-            "key":              "FFmpegExtractAudio",
-            "preferredcodec":   "mp3",
-            "preferredquality": "128",
-        }],
     })
-    with yt_dlp.YoutubeDL(dl_opts) as ydl:
-        ydl.download([track.url])
-    files = _glob.glob(os.path.join(tmpdir, "*.mp3"))
-    if not files:
-        files = _glob.glob(os.path.join(tmpdir, "*.*"))
-    if not files:
-        raise Exception("Không tải được file audio")
-    log.info("Downloaded: %s (%.1fMB)", os.path.basename(files[0]), os.path.getsize(files[0])/1024/1024)
-    return files[0]
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(track.url, download=False)
+        formats = info.get("formats", [])
+        # Audio only
+        for f in reversed(formats):
+            if f.get("acodec","none") != "none" and f.get("vcodec","none") == "none" and f.get("url"):
+                log.info("Audio stream: ext=%s abr=%s", f.get("ext"), f.get("abr"))
+                return f["url"]
+        # Any with audio
+        for f in reversed(formats):
+            if f.get("acodec","none") != "none" and f.get("url"):
+                log.info("Muxed stream: ext=%s", f.get("ext"))
+                return f["url"]
+        if info.get("url"):
+            return info["url"]
+    raise Exception("No stream URL found")
 
 def _get_video_urls(track: Track):
     """Lấy URL stream video+audio trực tiếp — không download, phát ngay."""
