@@ -97,7 +97,8 @@ class GState:
     paused:     bool            = False
     np_msg:     int             = 0
     tmp_file:   str             = ""
-    is_playing: bool            = False  # True sau khi calls.play() thành công
+    is_playing:  bool  = False
+    _play_start: float = 0.0
 
 _states: dict[int, GState] = {}
 
@@ -425,9 +426,9 @@ async def _play_next(client: Client, cid: int):
                     ms = MediaStream(stream_url)
 
 
+        import time as _time
+        g._play_start = _time.time()  # Lưu thời điểm bắt đầu play
         await calls.play(cid, ms)
-        # Đợi 2 giây để StreamEnded giả bắn xong rồi mới set is_playing
-        await asyncio.sleep(2)
         g.is_playing = True
         log.info("calls.play OK")
         await _send_np(client, cid, track)
@@ -477,14 +478,17 @@ async def _on_update(_, update):
             should_next = True
 
     if should_next:
+        import time as _time
         g = st(cid)
-        # Chỉ trigger khi đang thật sự phát nhạc
-        if g.current and g.is_playing:
+        elapsed = _time.time() - getattr(g, "_play_start", 0)
+        log.info("StreamEnded: is_playing=%s elapsed=%.1fs", g.is_playing, elapsed)
+        # Bỏ qua nếu mới play < 3 giây (StreamEnded giả)
+        if g.current and g.is_playing and elapsed > 3:
             g.is_playing = False
             log.info("Stream ended → next track in %d", cid)
             await _play_next(bot, cid)
         else:
-            log.info("StreamEnded ignored (is_playing=%s, current=%s)", g.is_playing, g.current)
+            log.info("StreamEnded ignored (too soon or not playing)")
 
 # ══════════════════════════════════════════════════
 #  Search result cache + keyboard
@@ -917,3 +921,4 @@ if __name__ == "__main__":
                 import time; time.sleep(5)
             else:
                 import time; time.sleep(15)
+
