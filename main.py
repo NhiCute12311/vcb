@@ -426,6 +426,10 @@ async def _play_next(client: Client, cid: int):
 
 
         await calls.play(cid, ms)
+        # Đợi 2 giây để StreamEnded giả bắn xong rồi mới set is_playing
+        await asyncio.sleep(2)
+        g.is_playing = True
+        log.info("calls.play OK")
         await _send_np(client, cid, track)
         log.info("▶ Playing%s: %s [chat=%d]", " [VIDEO]" if track.is_video else "", track.title, cid)
     except Exception as e:
