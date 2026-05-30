@@ -392,7 +392,8 @@ def _get_stream_url(track: Track) -> str:
     last_err = None
     for clients in _CLIENT_SETS:
         try:
-            opts = _yt_opts({"format": "bestaudio/best", "check_formats": False}, clients=clients)
+            # KHÔNG set "format" — để tự chọn từ formats list (mọi client đều có)
+            opts = _yt_opts({"check_formats": False}, clients=clients)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(track.url, download=False)
                 url = _extract_audio_url(info)
@@ -656,8 +657,21 @@ async def _play_next(client: Client, cid: int):
     except Exception as e:
         log.error("_play_next error: %s", e)
         err_low = str(e).lower()
-        if "no active" in err_low or "groupcall" in err_low or "not found" in err_low or "bot_method" in err_low or "invalid" in err_low or "no group call" in err_low:
-            # VC không tồn tại/đã đóng → reset sạch, không giữ queue cũ
+        # AUTH_KEY_DUPLICATED = lỗi tạm thời → GIỮ queue, thử lại sau 3s
+        if "auth_key" in err_low or "duplicated" in err_low:
+            log.warning("AUTH_KEY lỗi tạm — giữ queue, thử lại sau 3s")
+            g.is_playing = False
+            # đưa bài lại đầu queue để phát lại
+            if g.current:
+                g.queue.appendleft(g.current)
+                g.current = None
+            await asyncio.sleep(3)
+            await _play_next(client, cid)
+            return
+        # VC THẬT SỰ không mở (không phải lỗi auth)
+        if (("no active" in err_low or "not found" in err_low or "bot_method" in err_low
+             or "no group call" in err_low or "groupcall_invalid" in err_low)
+                and "auth" not in err_low):
             await _reset_state(cid, "no active VC")
             await client.send_message(
                 cid,
@@ -733,9 +747,15 @@ async def _on_update(_, update):
     cls = type(update).__name__
     log.info("VC update: %s in %d", cls, cid)
 
-    # ── VC bị đóng (người tắt voice chat) → reset toàn bộ ──
-    if cls in ("ClosedVoiceChat", "GroupCallClosed", "Closed", "LeftGroupCall",
-               "LeftVoiceChat", "KickedFromGroupCall"):
+    g = st(cid)
+
+    # ── VC bị đóng THẬT SỰ → reset ──
+    # Chỉ nhận đúng các class đóng VC, KHÔNG dùng tên chung chung "Closed"/"Left"
+    if cls in ("ClosedVoiceChat", "GroupCallClosed", "KickedFromGroupCall"):
+        # Chỉ reset nếu đang thật sự phát (tránh phantom event lúc rảnh)
+        if not g.current and not g.queue and not g.is_playing:
+            log.info("VC closed event nhưng bot đang rảnh — bỏ qua")
+            return
         log.info("VC closed (%s) in %d → reset", cls, cid)
         try:
             await calls.leave_call(cid)
@@ -751,24 +771,22 @@ async def _on_update(_, update):
     # ── Stream kết thúc bình thường → phát bài tiếp ──
     should_next = False
     if _HAS_STREAM_EVENTS:
-        if isinstance(update, StreamAudioEnded):
-            should_next = True
-        elif isinstance(update, StreamVideoEnded):
+        if isinstance(update, (StreamAudioEnded, StreamVideoEnded)):
             should_next = True
     if cls in ("StreamAudioEnded", "StreamVideoEnded", "StreamEnded"):
         should_next = True
 
     if should_next:
         import time as _time
-        g = st(cid)
         elapsed = _time.time() - getattr(g, "_play_start", 0)
         log.info("StreamEnded: is_playing=%s elapsed=%.1fs", g.is_playing, elapsed)
+        # Chỉ chuyển bài khi đang phát thật + đã qua 5s (tránh event giả)
         if g.current and g.is_playing and elapsed > 5:
             g.is_playing = False
             log.info("Stream ended → next in %d", cid)
             await _play_next(bot, cid)
         else:
-            log.info("StreamEnded ignored (too soon)")
+            log.info("StreamEnded ignored (chưa phát hoặc quá sớm)")
 
 # ══════════════════════════════════════════════════
 #  Search result cache + keyboard
@@ -1359,7 +1377,12 @@ async def cmd_update_cookies(client: Client, msg: Message):
 
 @app.on_callback_query()
 async def on_cb(client: Client, cb: CallbackQuery):
-    data = cb.data
+    data = cb.data or ""
+
+    # BỎ QUA callback của module phim (ph|...) — để phim_module xử lý
+    if data.startswith("ph|"):
+        return
+
     cid  = cb.message.chat.id
     g    = st(cid)
 
@@ -1571,10 +1594,9 @@ async def _start():
     log.info("✅ PyTgCalls sẵn sàng — Bot đang chạy!")
 
 async def _watchdog():
-    """Ping Telegram mỗi 60s + dọn file cookie tạm."""
+    """Dọn file cookie tạm mỗi 5 phút. KHÔNG ping userbot (gây AUTH_KEY_DUPLICATED)."""
     while True:
-        await asyncio.sleep(60)
-        # Dọn file cookie tạm cũ (ck_*.txt) để không leak disk
+        await asyncio.sleep(300)
         try:
             import tempfile, glob as _g
             for f in _g.glob(os.path.join(tempfile.gettempdir(), "ck_*.txt")):
@@ -1584,19 +1606,6 @@ async def _watchdog():
                     pass
         except Exception:
             pass
-        try:
-            await userbot.get_me()
-            await bot.get_me()
-        except Exception as e:
-            log.warning("Watchdog: kết nối yếu (%s), thử reconnect...", e)
-            try:
-                if not userbot.is_connected:
-                    await userbot.start()
-                if not bot.is_connected:
-                    await bot.start()
-                log.info("Watchdog: reconnected OK")
-            except Exception as re:
-                log.error("Watchdog reconnect failed: %s", re)
 
 async def _phim_on_play(client, chat_id, title, m3u8_url, mode):
     """Callback cho module phim: phát phim vào VC (vplay) hoặc livestream (rtmps)."""
