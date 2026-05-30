@@ -109,31 +109,44 @@ async def _rtmp_create_live(client, chat_id):
     res = await client.invoke(GetGroupCallStreamRtmpUrl(peer=peer, revoke=False))
     return res.url, res.key
 
-def _rtmp_push(media_url: str, rtmp_url: str, rtmp_key: str, is_video=True):
-    """Khởi chạy ffmpeg push media lên RTMP server của Telegram."""
+def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
+    """Push video+audio lên RTMP server Telegram. Ghi log ffmpeg để debug."""
     import subprocess
     target = rtmp_url.rstrip("/") + "/" + rtmp_key
-    if is_video:
+
+    rc = ["-reconnect", "1", "-reconnect_streamed", "1",
+          "-reconnect_delay_max", "5", "-rw_timeout", "15000000"]
+
+    if audio_url and audio_url != video_url:
+        # 2 input riêng: video-only + audio-only → merge
         cmd = [
-            "ffmpeg", "-re",
-            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-            "-i", media_url,
+            "ffmpeg", "-re", *rc, "-i", video_url,
+            "-re", *rc, "-i", audio_url,
+            "-map", "0:v:0", "-map", "1:a:0",
             "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-b:v", "1500k", "-maxrate", "1500k", "-bufsize", "3000k",
-            "-pix_fmt", "yuv420p", "-g", "50",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-            "-f", "flv", target,
+            "-profile:v", "baseline", "-level", "3.1",
+            "-b:v", "2000k", "-maxrate", "2000k", "-bufsize", "4000k",
+            "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", "-keyint_min", "60",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-f", "flv", "-flvflags", "no_duration_filesize",
+            target,
         ]
     else:
+        # 1 input muxed (có sẵn cả video+audio)
         cmd = [
-            "ffmpeg", "-re",
-            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-            "-i", media_url,
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-            "-f", "flv", target,
+            "ffmpeg", "-re", *rc, "-i", video_url,
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-profile:v", "baseline", "-level", "3.1",
+            "-b:v", "2000k", "-maxrate", "2000k", "-bufsize", "4000k",
+            "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", "-keyint_min", "60",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+            "-f", "flv", "-flvflags", "no_duration_filesize",
+            target,
         ]
-    log.info("FFmpeg push → %s", target[:50])
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    log.info("FFmpeg push → %s", target[:55])
+    # Ghi log ffmpeg ra file để debug
+    logf = open("/tmp/ffmpeg_rtmp.log", "w")
+    return subprocess.Popen(cmd, stdout=logf, stderr=logf)
 
 def _rtmp_stop(chat_id):
     """Dừng ffmpeg process của group."""
@@ -816,7 +829,7 @@ async def cmd_start(_, msg: Message):
 
 # ── Chặn user bị ban TRƯỚC mọi lệnh khác ──────────
 @app.on_message(filters.command([
-    "play", "video", "stream", "rtmp", "playrtmp", "playrtmps", "setrtmps", "stoprtmps", "skip",
+    "play", "video", "stream", "rtmp", "playrtmp", "playrtmps", "setrtmps", "stoprtmps", "fflog", "skip",
     "stop", "pause", "resume", "queue", "np", "loop", "clear"
 ]) & filters.group, group=-2)
 async def _ban_guard(client: Client, msg: Message):
@@ -1058,6 +1071,22 @@ async def cmd_stoprtmps(client: Client, msg: Message):
     _rtmp_live.pop(cid, None)
     _rtmps_mode.discard(cid)
     await msg.reply("⏹ Đã dừng Live Stream RTMP.\n(Để đóng hẳn livestream, dùng nút Telegram trong group)")
+
+@app.on_message(filters.command(["fflog"]) & filters.group)
+async def cmd_fflog(client: Client, msg: Message):
+    """Xem log ffmpeg để debug RTMP."""
+    try:
+        with open("/tmp/ffmpeg_rtmp.log", encoding="utf-8", errors="ignore") as f:
+            data = f.read()
+        # Lấy 1500 ký tự cuối
+        tail = data[-1500:] if len(data) > 1500 else data
+        if not tail.strip():
+            tail = "(log trống — ffmpeg chưa chạy hoặc chưa ghi gì)"
+        await msg.reply(f"```\n{tail}\n```")
+    except FileNotFoundError:
+        await msg.reply("Chưa có log ffmpeg.")
+    except Exception as e:
+        await msg.reply(f"Lỗi đọc log: {e}")
 
 @app.on_message(filters.command("skip") & filters.group)
 async def cmd_skip(client: Client, msg: Message):
@@ -1341,9 +1370,8 @@ async def on_cb(client: Client, cb: CallbackQuery):
                 )
                 # Dừng ffmpeg cũ nếu đang chạy
                 _rtmp_stop(cid)
-                # Push lên RTMP — ưu tiên video_url (đã có cả tiếng nếu muxed)
-                # Dùng video_url làm input chính
-                proc = _rtmp_push(video_url, info["url"], info["key"], is_video=True)
+                # Push lên RTMP với cả video + audio
+                proc = _rtmp_push(video_url, audio_url, info["url"], info["key"])
                 info["proc"] = proc
                 await st_msg.edit(
                     f"🔴 **ĐANG PHÁT LIVE:** {track.title}\n"
