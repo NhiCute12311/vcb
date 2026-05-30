@@ -124,18 +124,20 @@ def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
 
     is_hls = ".m3u8" in (video_url or "").lower()
 
-    # Input flags — HLS cần thêm protocol_whitelist
+    # Input flags — buffer lớn để chịu được KKPhim trả segment chậm
     rc = [
         "-reconnect", "1", "-reconnect_at_eof", "1",
-        "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
-        "-thread_queue_size", "8192",
+        "-reconnect_streamed", "1", "-reconnect_delay_max", "30",
+        "-thread_queue_size", "16384",
         "-analyzeduration", "15000000", "-probesize", "15000000",
         "-user_agent", "Mozilla/5.0",
+        # Buffer đọc 50MB — tải trước nhiều segment, chống lag khi server chậm
+        "-rtbufsize", "50M",
     ]
     if is_hls:
         rc = ["-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls"] + rc
-        # m3u8_flags: sống sót khi 1 segment lỗi, không dừng cả stream
-        rc = rc + ["-m3u8_hold_counters", "10", "-max_reload", "20"]
+        rc = rc + ["-m3u8_hold_counters", "20", "-max_reload", "1000",
+                   "-http_persistent", "1", "-http_multiple", "1"]
     else:
         rc = rc + ["-rw_timeout", "30000000"]
 
@@ -150,7 +152,8 @@ def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
         "-force_key_frames", "expr:gte(t,n_forced*2)",
     ]
     aenc = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
-    flv = ["-f", "flv", "-flvflags", "no_duration_filesize", target]
+    flv = ["-max_muxing_queue_size", "9999",
+           "-f", "flv", "-flvflags", "no_duration_filesize", target]
 
     # LUÔN dùng -re: phim KKPhim là VOD (m3u8 có sẵn toàn bộ), phải phát đúng tốc độ thực
     # Nếu bỏ -re thì ffmpeg đẩy 5-6x → hết phim trong vài phút rồi dừng
