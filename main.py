@@ -118,39 +118,47 @@ async def _rtmp_create_live(client, chat_id):
     return res.url, res.key
 
 def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
-    """Push video+audio lên RTMP Telegram — chống đơ, chất lượng cao 720p."""
+    """Push video+audio lên RTMP Telegram. Hỗ trợ HLS/m3u8."""
     import subprocess
     target = rtmp_url.rstrip("/") + "/" + rtmp_key
 
-    # Chống đơ: reconnect mạnh + thread_queue lớn + analyzeduration cao
+    is_hls = ".m3u8" in (video_url or "").lower()
+
+    # Input flags — HLS cần thêm protocol_whitelist
     rc = [
         "-reconnect", "1", "-reconnect_at_eof", "1",
         "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
-        "-rw_timeout", "30000000",
-        "-thread_queue_size", "4096",
-        "-analyzeduration", "10000000", "-probesize", "10000000",
+        "-thread_queue_size", "8192",
+        "-analyzeduration", "15000000", "-probesize", "15000000",
+        "-user_agent", "Mozilla/5.0",
     ]
-    # Encode: chất lượng cao hơn (3500k, preset fast), keyframe đều chống giật
+    if is_hls:
+        rc = ["-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls"] + rc
+    else:
+        rc = rc + ["-rw_timeout", "30000000"]
+
+    # Encode nhẹ hơn để Railway CPU theo kịp (speed > 1.0x) — 480p, ultrafast
     venc = [
-        "-c:v", "libx264", "-preset", "fast", "-tune", "zerolatency",
-        "-profile:v", "main", "-level", "4.0",
-        "-b:v", "3500k", "-maxrate", "3500k", "-bufsize", "7000k",
-        "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", "-keyint_min", "60",
-        "-sc_threshold", "0",
-        # scale về 720p cho nét + ổn định
-        "-vf", "scale=-2:720",
+        "-c:v", "libx264", "-preset", "ultrafast",
+        "-profile:v", "main", "-level", "3.1",
+        "-b:v", "1500k", "-maxrate", "1500k", "-bufsize", "3000k",
+        "-pix_fmt", "yuv420p", "-r", "25", "-g", "50", "-keyint_min", "50",
+        "-sc_threshold", "0", "-vf", "scale=-2:480,format=yuv420p",
     ]
-    aenc = ["-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2"]
+    aenc = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
     flv = ["-f", "flv", "-flvflags", "no_duration_filesize", target]
 
+    # HLS đã realtime → KHÔNG dùng -re (gây chậm). File/URL thường mới cần -re.
+    re_flag = [] if is_hls else ["-re"]
+
     if audio_url and audio_url != video_url:
-        cmd = ["ffmpeg", "-re", *rc, "-i", video_url,
-               "-re", *rc, "-i", audio_url,
+        cmd = ["ffmpeg", *re_flag, *rc, "-i", video_url,
+               *re_flag, *rc, "-i", audio_url,
                "-map", "0:v:0", "-map", "1:a:0", *venc, *aenc, *flv]
     else:
-        cmd = ["ffmpeg", "-re", *rc, "-i", video_url, *venc, *aenc, *flv]
+        cmd = ["ffmpeg", *re_flag, *rc, "-i", video_url, *venc, *aenc, *flv]
 
-    log.info("FFmpeg push → %s", target[:55])
+    log.info("FFmpeg push (hls=%s) → %s", is_hls, target[:50])
     logf = open("/tmp/ffmpeg_rtmp.log", "w")
     return subprocess.Popen(cmd, stdout=logf, stderr=logf)
 
