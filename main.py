@@ -134,6 +134,8 @@ def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
     ]
     if is_hls:
         rc = ["-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls"] + rc
+        # m3u8_flags: sống sót khi 1 segment lỗi, không dừng cả stream
+        rc = rc + ["-m3u8_hold_counters", "10", "-max_reload", "20"]
     else:
         rc = rc + ["-rw_timeout", "30000000"]
 
@@ -150,8 +152,9 @@ def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
     aenc = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
     flv = ["-f", "flv", "-flvflags", "no_duration_filesize", target]
 
-    # HLS đã realtime → bỏ -re cho nhanh
-    re_flag = [] if is_hls else ["-re"]
+    # LUÔN dùng -re: phim KKPhim là VOD (m3u8 có sẵn toàn bộ), phải phát đúng tốc độ thực
+    # Nếu bỏ -re thì ffmpeg đẩy 5-6x → hết phim trong vài phút rồi dừng
+    re_flag = ["-re"]
 
     if audio_url and audio_url != video_url:
         cmd = ["ffmpeg", *re_flag, *rc, "-i", video_url,
@@ -1746,3 +1749,4 @@ if __name__ == "__main__":
                 import time; time.sleep(5)
             else:
                 import time; time.sleep(15)
+
