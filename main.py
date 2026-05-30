@@ -72,6 +72,28 @@ API_ID    = 39030508
 API_HASH  = "c7feab6d38db177b863ad909e4f66f0b"
 BOT_TOKEN = "8254987879:AAGCLxCes79aDF6rGsZl1L4oPZUfTqj7uw0"
 
+# Admin tối cao — có mọi quyền (skip bất kỳ bài nào, quản lý whitelist)
+ADMIN_USERNAME = "neweixyz"   # không có @
+
+# Whitelist: tập user_id được skip bất kỳ bài nào (như admin)
+# Lưu theo từng group: {chat_id: set(user_id)}
+_whitelist: dict[int, set] = {}
+
+def _get_wl(cid: int) -> set:
+    if cid not in _whitelist:
+        _whitelist[cid] = set()
+    return _whitelist[cid]
+
+async def _is_privileged(client, cid: int, user_id: int, username: str = "") -> bool:
+    """True nếu là admin tối cao hoặc trong whitelist."""
+    # Admin tối cao theo username
+    if username and username.lower() == ADMIN_USERNAME.lower():
+        return True
+    # Trong whitelist của group
+    if user_id in _get_wl(cid):
+        return True
+    return False
+
 # ══════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════
@@ -90,15 +112,14 @@ class Track:
 
 @dataclass
 class GState:
-    queue:      deque           = field(default_factory=deque)
-    current:    Optional[Track] = None
-    loop:       bool            = False
-    volume:     int             = 100
-    paused:     bool            = False
-    np_msg:     int             = 0
-    tmp_file:   str             = ""
-    is_playing:  bool  = False
-    _play_start: float = 0.0
+    queue:       deque           = field(default_factory=deque)
+    current:     Optional[Track] = None
+    loop:        bool            = False
+    paused:      bool            = False
+    np_msg:      int             = 0
+    tmp_file:    str             = ""
+    is_playing:  bool            = False
+    _play_start: float           = 0.0
 
 _states: dict[int, GState] = {}
 
@@ -133,13 +154,24 @@ def _find_ffmpeg():
 
 _FFMPEG_LOC = _find_ffmpeg()
 
-def _yt_opts(extra: dict = {}) -> dict:
+# Các client để thử lần lượt khi 1 cái bị YouTube chặn
+_CLIENT_SETS = [
+    ["android"],
+    ["ios"],
+    ["tv_embedded"],
+    ["web_safari"],
+    ["android", "web"],
+    ["mweb"],
+]
+
+def _yt_opts(extra: dict = {}, clients=None) -> dict:
     opts = {
         "quiet":        True,
         "no_warnings":  True,
+        "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "web"],
+                "player_client": clients or ["android", "web"],
             }
         },
         **extra
@@ -182,71 +214,93 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
 
 import tempfile, glob
 
-def _get_stream_url(track: Track) -> str:
-    """Lấy direct stream URL từ yt-dlp."""
-    opts = _yt_opts({
-        "format":        "bestaudio/best",
-        "check_formats": False,
-    })
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(track.url, download=False)
-        formats = info.get("formats", [])
-        # Audio only
-        for f in reversed(formats):
-            if f.get("acodec","none") != "none" and f.get("vcodec","none") == "none" and f.get("url"):
-                log.info("Audio stream: ext=%s abr=%s", f.get("ext"), f.get("abr"))
-                return f["url"]
-        # Any with audio
-        for f in reversed(formats):
-            if f.get("acodec","none") != "none" and f.get("url"):
-                log.info("Muxed stream: ext=%s", f.get("ext"))
-                return f["url"]
-        if info.get("url"):
-            return info["url"]
-    raise Exception("No stream URL found")
+def _extract_audio_url(info) -> str:
+    formats = info.get("formats", [])
+    for f in reversed(formats):
+        if f.get("acodec","none") != "none" and f.get("vcodec","none") == "none" and f.get("url"):
+            log.info("Audio stream: ext=%s abr=%s", f.get("ext"), f.get("abr"))
+            return f["url"]
+    for f in reversed(formats):
+        if f.get("acodec","none") != "none" and f.get("url"):
+            log.info("Muxed stream: ext=%s", f.get("ext"))
+            return f["url"]
+    if info.get("url"):
+        return info["url"]
+    return ""
 
-def _get_video_urls(track: Track):
-    """Lấy URL stream video+audio trực tiếp — không download, phát ngay."""
-    opts = _yt_opts({
-        "check_formats":        False,
-        "no_check_certificate": True,
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0",
-        },
-    })
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(track.url, download=False)
-        formats = info.get("formats", [])
-        audio_url = None
-        video_url = None
-        # Audio only
+def _get_stream_url(track: Track) -> str:
+    """Lấy direct stream URL — thử nhiều client cho tới khi được."""
+    last_err = None
+    for clients in _CLIENT_SETS:
+        try:
+            opts = _yt_opts({"format": "bestaudio/best", "check_formats": False}, clients=clients)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(track.url, download=False)
+                url = _extract_audio_url(info)
+                if url:
+                    log.info("OK với client=%s", clients)
+                    return url
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            if "sign in" in msg or "bot" in msg or "403" in msg or "forbidden" in msg:
+                log.warning("Client %s bị chặn, thử client khác...", clients)
+                continue
+            else:
+                log.warning("Client %s lỗi: %s", clients, e)
+                continue
+    raise Exception(f"Tất cả client đều bị chặn: {last_err}")
+
+def _pick_video(info):
+    formats = info.get("formats", [])
+    audio_url = None
+    video_url = None
+    # Audio only — chất lượng cao
+    for f in reversed(formats):
+        if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none" and f.get("url"):
+            audio_url = f["url"]
+            break
+    # Video 720p để nét (mp4 ưu tiên)
+    best_h = 0
+    for f in formats:
+        h = f.get("height") or 0
+        if f.get("vcodec", "none") != "none" and f.get("acodec", "none") == "none" and h <= 720 and f.get("url"):
+            if h > best_h:
+                best_h = h
+                video_url = f["url"]
+    if not video_url:
         for f in reversed(formats):
-            if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none" and f.get("url"):
-                audio_url = f["url"]
-                break
-        # Video only 480p
-        for f in formats:
-            h = f.get("height") or 0
-            if f.get("vcodec", "none") != "none" and f.get("acodec", "none") == "none" and 360 <= h <= 480 and f.get("url"):
+            if f.get("vcodec", "none") != "none" and f.get("url"):
                 video_url = f["url"]
                 break
-        # Fallback video
-        if not video_url:
-            for f in reversed(formats):
-                if f.get("vcodec", "none") != "none" and f.get("url"):
-                    video_url = f["url"]
-                    break
-        # Fallback audio
-        if not audio_url:
-            for f in reversed(formats):
-                if f.get("acodec", "none") != "none" and f.get("url"):
-                    audio_url = f["url"]
-                    break
-        if not video_url or not audio_url:
-            url = info.get("url") or formats[-1]["url"]
-            return url, url
-        log.info("Video: %s | Audio: %s", video_url[:60], audio_url[:60])
-        return audio_url, video_url
+    if not audio_url:
+        for f in reversed(formats):
+            if f.get("acodec", "none") != "none" and f.get("url"):
+                audio_url = f["url"]
+                break
+    return audio_url, video_url
+
+def _get_video_urls(track: Track):
+    """Lấy URL video+audio — thử nhiều client, 720p cho nét."""
+    last_err = None
+    for clients in _CLIENT_SETS:
+        try:
+            opts = _yt_opts({
+                "check_formats": False,
+                "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0"},
+            }, clients=clients)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(track.url, download=False)
+                audio_url, video_url = _pick_video(info)
+                if video_url and audio_url:
+                    log.info("Video OK client=%s h<=720", clients)
+                    return audio_url, video_url
+                elif info.get("url"):
+                    return info["url"], info["url"]
+        except Exception as e:
+            last_err = e
+            continue
+    raise Exception(f"Video: tất cả client bị chặn: {last_err}")
 
 def _fmt(s: int) -> str:
     if s <= 0: return "?"
@@ -285,6 +339,7 @@ bot = Client(
     bot_token=BOT_TOKEN,
     in_memory=True,
     sleep_threshold=60,
+    max_concurrent_transmissions=4,   # xử lý nhiều lệnh song song
 )
 # app = bot (dùng cho handlers)
 app   = bot
@@ -299,11 +354,6 @@ def _np_kb(g: GState) -> InlineKeyboardMarkup:
             InlineKeyboardButton("▶️ Resume" if g.paused else "⏸ Pause", callback_data="vc_pause"),
             InlineKeyboardButton("⏭ Skip",   callback_data="vc_skip"),
             InlineKeyboardButton("⏹ Stop",   callback_data="vc_stop"),
-        ],
-        [
-            InlineKeyboardButton("🔉",               callback_data="vc_vdown"),
-            InlineKeyboardButton(f"🔊 {g.volume}%",  callback_data="vc_vol"),
-            InlineKeyboardButton("🔊",               callback_data="vc_vup"),
         ],
         [
             InlineKeyboardButton("🔁 Loop ON" if g.loop else "➡️ Loop OFF", callback_data="vc_loop"),
@@ -529,18 +579,21 @@ def _search_kb(tracks: list[Track], src: str) -> InlineKeyboardMarkup:
 @app.on_message(filters.command("start"))
 async def cmd_start(_, msg: Message):
     await msg.reply(
-        "🎵 Voice Chat Music Bot\n\n"
-        "`/play <tên bài>` — Tìm và phát từ YouTube\n"
-        "`/skip`           — Bỏ qua bài hiện tại\n"
+        "🎵 **Voice Chat Music Bot**\n\n"
+        "`/play <tên bài>` — Phát nhạc từ YouTube\n"
+        "`/video <tên>`    — Stream video vào VC\n"
+        "`/skip`           — Bỏ qua bài (chỉ người chọn bài)\n"
         "`/stop`           — Dừng và thoát VC\n"
-        "`/pause`          — Tạm dừng\n"
-        "`/resume`         — Tiếp tục phát\n"
+        "`/pause` `/resume`— Tạm dừng / tiếp tục\n"
         "`/queue`          — Xem hàng chờ\n"
         "`/np`             — Bài đang phát\n"
-        "`/volume 80`      — Chỉnh âm lượng (0–200)\n"
         "`/loop`           — Bật / tắt lặp lại\n"
         "`/clear`          — Xoá hàng chờ\n\n"
-        "⚠️ Bot phải là **admin** trong group và group phải có **Voice Chat đang mở**."
+        "**Admin:**\n"
+        "`/wl @user`       — Cho phép skip mọi bài\n"
+        "`/unwl @user`     — Gỡ quyền skip\n"
+        "`/wllist`         — Xem danh sách whitelist\n\n"
+        "⚠️ Group phải có **Voice Chat đang mở** trước khi dùng."
     )
 
 @app.on_message(filters.command("play") & filters.group)
@@ -599,11 +652,15 @@ async def cmd_skip(client: Client, msg: Message):
         await msg.reply("❌ Không có bài nào đang phát.")
         return
 
-    user_id = msg.from_user.id if msg.from_user else 0
+    user_id  = msg.from_user.id if msg.from_user else 0
+    username = msg.from_user.username if msg.from_user else ""
 
-    # Chỉ người yêu cầu bài mới được skip
-    if g.current.requester_id != user_id:
-        await msg.reply(f"❌ Chỉ **{g.current.requester}** (người yêu cầu) mới được skip bài này!")
+    # Người yêu cầu bài HOẶC admin/whitelist được skip
+    is_owner = (g.current.requester_id == user_id)
+    is_priv  = await _is_privileged(client, msg.chat.id, user_id, username)
+
+    if not is_owner and not is_priv:
+        await msg.reply(f"❌ Chỉ **{g.current.requester}** (người yêu cầu) hoặc người có quyền mới được skip!")
         return
 
     title  = g.current.title
@@ -689,23 +746,85 @@ async def cmd_loop(client: Client, msg: Message):
     await msg.reply(f"Lặp lại: **{'BẬT 🔁' if g.loop else 'TẮT ➡️'}**")
     await _update_np(client, msg.chat.id)
 
-@app.on_message(filters.command("volume") & filters.group)
-async def cmd_volume(client: Client, msg: Message):
-    g = st(msg.chat.id)
-    args = msg.command[1:]
-    if not args or not args[0].isdigit():
-        await msg.reply(f"🔊 Âm lượng hiện tại: {g.volume}%\nDùng: /volume 80")
+@app.on_message(filters.command(["whitelist", "wl"]) & filters.group)
+async def cmd_whitelist(client: Client, msg: Message):
+    """Admin thêm người vào whitelist (được skip mọi bài). Reply tin nhắn của họ hoặc tag @user."""
+    user_id  = msg.from_user.id if msg.from_user else 0
+    username = msg.from_user.username if msg.from_user else ""
+
+    # Chỉ admin tối cao mới được quản lý whitelist
+    if not (username and username.lower() == ADMIN_USERNAME.lower()):
+        await msg.reply("❌ Chỉ admin mới được quản lý whitelist.")
         return
-    vol = max(0, min(200, int(args[0])))
-    g.volume = vol
-    try:
-        await calls.change_volume_call(msg.chat.id, vol)
-        log.info("Volume set to %d in %d", vol, msg.chat.id)
-    except Exception as ve:
-        log.warning("volume error: %s", ve)
-        await msg.reply(f"⚠️ Không chỉnh được volume: {ve}")
-    await msg.reply(f"🔊 Âm lượng: **{vol}%**")
-    await _update_np(client, msg.chat.id)
+
+    target_id   = None
+    target_name = ""
+    # Cách 1: reply tin nhắn
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id   = msg.reply_to_message.from_user.id
+        target_name = msg.reply_to_message.from_user.first_name
+    # Cách 2: tag username
+    elif len(msg.command) > 1:
+        uname = msg.command[1].lstrip("@")
+        try:
+            u = await client.get_users(uname)
+            target_id   = u.id
+            target_name = u.first_name
+        except Exception:
+            await msg.reply(f"❌ Không tìm thấy user @{uname}")
+            return
+
+    if not target_id:
+        await msg.reply("Dùng: reply tin nhắn của người đó + `/wl`, hoặc `/wl @username`")
+        return
+
+    _get_wl(msg.chat.id).add(target_id)
+    await msg.reply(f"✅ Đã thêm **{target_name}** vào whitelist — giờ có thể skip mọi bài.")
+
+@app.on_message(filters.command(["unwhitelist", "unwl"]) & filters.group)
+async def cmd_unwhitelist(client: Client, msg: Message):
+    user_id  = msg.from_user.id if msg.from_user else 0
+    username = msg.from_user.username if msg.from_user else ""
+    if not (username and username.lower() == ADMIN_USERNAME.lower()):
+        await msg.reply("❌ Chỉ admin mới được quản lý whitelist.")
+        return
+
+    target_id = None
+    target_name = ""
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id   = msg.reply_to_message.from_user.id
+        target_name = msg.reply_to_message.from_user.first_name
+    elif len(msg.command) > 1:
+        uname = msg.command[1].lstrip("@")
+        try:
+            u = await client.get_users(uname)
+            target_id   = u.id
+            target_name = u.first_name
+        except Exception:
+            await msg.reply(f"❌ Không tìm thấy user @{uname}")
+            return
+
+    if not target_id:
+        await msg.reply("Dùng: reply tin nhắn + `/unwl`, hoặc `/unwl @username`")
+        return
+
+    _get_wl(msg.chat.id).discard(target_id)
+    await msg.reply(f"✅ Đã xoá **{target_name}** khỏi whitelist.")
+
+@app.on_message(filters.command("wllist") & filters.group)
+async def cmd_wllist(client: Client, msg: Message):
+    wl = _get_wl(msg.chat.id)
+    if not wl:
+        await msg.reply("📋 Whitelist trống.")
+        return
+    names = []
+    for uid in wl:
+        try:
+            u = await client.get_users(uid)
+            names.append(f"• {u.first_name} (@{u.username or uid})")
+        except Exception:
+            names.append(f"• {uid}")
+    await msg.reply("📋 **Whitelist:**\n" + "\n".join(names))
 
 @app.on_message(filters.command("clear") & filters.group)
 async def cmd_clear(_, msg: Message):
@@ -788,20 +907,17 @@ async def on_cb(client: Client, cb: CallbackQuery):
             await cb.answer("Không có bài nào đang phát")
             return
 
-        user_id = cb.from_user.id
-        if g.current.requester_id != user_id:
-            await cb.answer(
-                f"❌ Chỉ {g.current.requester} mới được skip!",
-                show_alert=True
-            )
+        user_id  = cb.from_user.id
+        username = cb.from_user.username or ""
+        is_owner = (g.current.requester_id == user_id)
+        is_priv  = await _is_privileged(client, cid, user_id, username)
+        if not is_owner and not is_priv:
+            await cb.answer(f"❌ Chỉ {g.current.requester} hoặc người có quyền mới được skip!", show_alert=True)
             return
 
         await cb.answer(f"⏭ {g.current.title[:20]}")
         g.loop = False
-        try:
-            await calls.leave_call(cid)
-        except Exception:
-            pass
+        g.current = None
         await _play_next(client, cid)
         return
 
@@ -829,31 +945,6 @@ async def on_cb(client: Client, cb: CallbackQuery):
         g.loop = not g.loop
         await cb.answer("🔁 Loop BẬT" if g.loop else "➡️ Loop TẮT")
         await _update_np(client, cid)
-        return
-
-    # ── Volume ─────────────────────────────────────
-    if data == "vc_vup":
-        g.volume = min(200, g.volume + 20)
-        try:
-            await calls.change_volume_call(cid, g.volume)
-        except Exception as ve:
-            log.warning("vol+ error: %s", ve)
-        await cb.answer(f"🔊 {g.volume}%")
-        await _update_np(client, cid)
-        return
-
-    if data == "vc_vdown":
-        g.volume = max(0, g.volume - 20)
-        try:
-            await calls.change_volume_call(cid, g.volume)
-        except Exception as ve:
-            log.warning("vol- error: %s", ve)
-        await cb.answer(f"🔉 {g.volume}%")
-        await _update_np(client, cid)
-        return
-
-    if data == "vc_vol":
-        await cb.answer(f"🔊 Âm lượng hiện tại: {g.volume}%", show_alert=True)
         return
 
     # ── Queue preview ──────────────────────────────
@@ -959,4 +1050,3 @@ if __name__ == "__main__":
                 import time; time.sleep(5)
             else:
                 import time; time.sleep(15)
-
