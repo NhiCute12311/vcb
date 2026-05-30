@@ -137,18 +137,20 @@ def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
     else:
         rc = rc + ["-rw_timeout", "30000000"]
 
-    # Encode nhẹ hơn để Railway CPU theo kịp (speed > 1.0x) — 480p, ultrafast
+    # 720p nét + ultrafast để CPU Railway theo kịp realtime (speed > 1.0x)
     venc = [
-        "-c:v", "libx264", "-preset", "ultrafast",
-        "-profile:v", "main", "-level", "3.1",
-        "-b:v", "1500k", "-maxrate", "1500k", "-bufsize", "3000k",
-        "-pix_fmt", "yuv420p", "-r", "25", "-g", "50", "-keyint_min", "50",
-        "-sc_threshold", "0", "-vf", "scale=-2:480,format=yuv420p",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-profile:v", "main", "-level", "4.0",
+        "-b:v", "3000k", "-maxrate", "3000k", "-bufsize", "6000k",
+        "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", "-keyint_min", "60",
+        "-sc_threshold", "0", "-vf", "scale=-2:720,format=yuv420p",
+        # Đảm bảo có keyframe ngay đầu để Telegram nhận hình ngay
+        "-force_key_frames", "expr:gte(t,n_forced*2)",
     ]
     aenc = ["-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2"]
     flv = ["-f", "flv", "-flvflags", "no_duration_filesize", target]
 
-    # HLS đã realtime → KHÔNG dùng -re (gây chậm). File/URL thường mới cần -re.
+    # HLS đã realtime → bỏ -re cho nhanh
     re_flag = [] if is_hls else ["-re"]
 
     if audio_url and audio_url != video_url:
