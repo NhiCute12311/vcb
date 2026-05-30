@@ -38,6 +38,11 @@ from pyrogram.types import (
 )
 from pytgcalls import PyTgCalls, idle
 from pytgcalls.types import MediaStream
+
+# Raw API cho Telegram Live Stream (RTMP)
+from pyrogram.raw.functions.phone import (
+    CreateGroupCall, GetGroupCallStreamRtmpUrl, GetGroupCall, DiscardGroupCall
+)
 try:
     from pytgcalls.types import AudioQuality, VideoQuality
     _HQ_AUDIO  = AudioQuality.HIGH
@@ -83,6 +88,62 @@ _banlist: dict[int, set] = {}
 _rtmp_default: dict[int, str] = {}
 # Group nào đang bật chế độ RTMPS (stream video)
 _rtmps_mode: set = set()
+# RTMP livestream info: {chat_id: {"url":..., "key":..., "proc": ffmpeg_process}}
+_rtmp_live: dict[int, dict] = {}
+
+async def _rtmp_create_live(client, chat_id):
+    """Tạo Telegram Live Stream (RTMP) và lấy url+key."""
+    peer = await client.resolve_peer(chat_id)
+    # Tạo group call ở chế độ RTMP
+    try:
+        await client.invoke(CreateGroupCall(
+            peer=peer,
+            random_id=client.rnd_id() % 2147483647,
+            rtmp_stream=True,
+        ))
+    except Exception as e:
+        # Có thể đã có call rồi — bỏ qua
+        if "already" not in str(e).lower() and "GROUPCALL_INVALID" not in str(e):
+            log.warning("CreateGroupCall: %s", e)
+    # Lấy url + key
+    res = await client.invoke(GetGroupCallStreamRtmpUrl(peer=peer, revoke=False))
+    return res.url, res.key
+
+def _rtmp_push(media_url: str, rtmp_url: str, rtmp_key: str, is_video=True):
+    """Khởi chạy ffmpeg push media lên RTMP server của Telegram."""
+    import subprocess
+    target = rtmp_url.rstrip("/") + "/" + rtmp_key
+    if is_video:
+        cmd = [
+            "ffmpeg", "-re",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            "-i", media_url,
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+            "-b:v", "1500k", "-maxrate", "1500k", "-bufsize", "3000k",
+            "-pix_fmt", "yuv420p", "-g", "50",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-f", "flv", target,
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-re",
+            "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+            "-i", media_url,
+            "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+            "-f", "flv", target,
+        ]
+    log.info("FFmpeg push → %s", target[:50])
+    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def _rtmp_stop(chat_id):
+    """Dừng ffmpeg process của group."""
+    info = _rtmp_live.get(chat_id)
+    if info and info.get("proc"):
+        try:
+            info["proc"].terminate()
+        except Exception:
+            pass
+        info["proc"] = None
 
 def _get_wl(cid: int) -> set:
     if cid not in _whitelist:
@@ -734,8 +795,9 @@ async def cmd_start(_, msg: Message):
         "`/video <tên>`    — Stream video YouTube vào VC\n"
         "`/playrtmp <link>`— Stream m3u8/RTMP/phim trực tiếp\n"
         "`/setrtmp <link>` — Lưu link RTMP mặc định\n"
-        "`/setrtmps`       — Bật chế độ RTMPS (stream video)\n"
-        "`/playrtmps <tên>`— Tìm video, chọn nguồn YT/SCL\n"
+        "`/setrtmps`       — Mở Live Stream 🔴 cho group\n"
+        "`/playrtmps <tên>`— Tìm video, chọn YT/SCL, phát lên live\n"
+        "`/stoprtmps`      — Dừng Live Stream\n"
         "`/skip`           — Bỏ qua bài (chỉ người chọn bài)\n"
         "`/stop`           — Dừng và thoát VC\n"
         "`/pause` `/resume`— Tạm dừng / tiếp tục\n"
@@ -754,7 +816,7 @@ async def cmd_start(_, msg: Message):
 
 # ── Chặn user bị ban TRƯỚC mọi lệnh khác ──────────
 @app.on_message(filters.command([
-    "play", "video", "stream", "rtmp", "playrtmp", "playrtmps", "setrtmps", "skip",
+    "play", "video", "stream", "rtmp", "playrtmp", "playrtmps", "setrtmps", "stoprtmps", "skip",
     "stop", "pause", "resume", "queue", "np", "loop", "clear"
 ]) & filters.group, group=-2)
 async def _ban_guard(client: Client, msg: Message):
@@ -948,21 +1010,25 @@ async def cmd_setrtmp(client: Client, msg: Message):
 
 @app.on_message(filters.command(["setrtmps"]) & filters.group)
 async def cmd_setrtmps(client: Client, msg: Message):
-    """Bật chế độ RTMPS — join VC sẵn, chuẩn bị stream video."""
+    """Mở Telegram Live Stream (RTMP) cho group — chuẩn bị phát."""
     cid = msg.chat.id
-    s = await msg.reply("📡 Đang bật chế độ RTMPS, kết nối VC...")
-    # Join VC sẵn bằng cách phát 1 stream im lặng ngắn — hoặc chỉ set cờ
-    _rtmps_mode.add(cid)
+    s = await msg.reply("📡 Đang mở Live Stream cho group...")
     try:
-        # Thử join VC (nếu VC đang mở) bằng 1 silent stream
-        # py-tgcalls cần 1 stream để join, dùng silence
+        # userbot tạo livestream (cần là owner/admin có quyền)
+        url, key = await _rtmp_create_live(userbot, cid)
+        _rtmp_live[cid] = {"url": url, "key": key, "proc": None}
+        _rtmps_mode.add(cid)
         await s.edit(
-            "✅ **Đã bật chế độ RTMPS!**\n"
-            "Giờ dùng `/playrtmps <tên video>` để tìm và phát.\n"
-            "Bot sẽ hỏi nguồn: YouTube hay SoundCloud."
+            "✅ **Đã mở Live Stream!** 🔴\n"
+            "Mọi người trong group bấm vào livestream để xem.\n\n"
+            "Giờ dùng `/playrtmps <tên>` để tìm video và phát lên live."
         )
     except Exception as e:
-        await s.edit(f"⚠️ Bật chế độ nhưng chưa join được VC: {e}")
+        err = str(e)
+        if "rtmp_stream" in err.lower() or "admin" in err.lower() or "CHAT_ADMIN" in err:
+            await s.edit("❌ Userbot cần là **chủ group** hoặc admin có quyền quản lý livestream.")
+        else:
+            await s.edit(f"❌ Lỗi mở live: {err}")
 
 @app.on_message(filters.command(["playrtmps"]) & filters.group)
 async def cmd_playrtmps(client: Client, msg: Message):
@@ -971,14 +1037,27 @@ async def cmd_playrtmps(client: Client, msg: Message):
     if not q:
         await msg.reply("❓ Dùng: `/playrtmps <tên video>`\nVD: `/playrtmps lofi hip hop`")
         return
+    cid = msg.chat.id
+    if cid not in _rtmp_live:
+        await msg.reply("❌ Chưa mở Live Stream! Gõ `/setrtmps` trước.")
+        return
     requester    = msg.from_user.first_name if msg.from_user else "?"
     requester_id = msg.from_user.id if msg.from_user else 0
-    # Hiện 2 nút chọn nguồn
     m = await msg.reply(
         f"🔍 **{q}**\nChọn nguồn để tìm video:",
         reply_markup=_source_kb(),
     )
-    _pending_src[m.id] = (q, True, requester, requester_id)
+    # tuple thứ 5 = True nghĩa là chế độ RTMPS (push live)
+    _pending_src[m.id] = (q, True, requester, requester_id, True)
+
+@app.on_message(filters.command(["stoprtmps"]) & filters.group)
+async def cmd_stoprtmps(client: Client, msg: Message):
+    """Dừng Live Stream RTMP."""
+    cid = msg.chat.id
+    _rtmp_stop(cid)          # dừng ffmpeg
+    _rtmp_live.pop(cid, None)
+    _rtmps_mode.discard(cid)
+    await msg.reply("⏹ Đã dừng Live Stream RTMP.\n(Để đóng hẳn livestream, dùng nút Telegram trong group)")
 
 @app.on_message(filters.command("skip") & filters.group)
 async def cmd_skip(client: Client, msg: Message):
@@ -1205,12 +1284,15 @@ async def on_cb(client: Client, cb: CallbackQuery):
         if not pending:
             await cb.answer("❌ Hết hạn, tìm lại nhé!", show_alert=True)
             return
-        query, is_video, requester, requester_id = pending
+        query        = pending[0]
+        is_video     = pending[1]
+        requester    = pending[2]
+        requester_id = pending[3]
+        is_rtmps     = pending[4] if len(pending) > 4 else False
         _pending_src.pop(cb.message.id, None)
         src_name = "YouTube" if source == "yt" else "SoundCloud"
         await cb.answer(f"🔍 Tìm trên {src_name}...")
         await cb.message.edit_text(f"🔍 Đang tìm **{query}** trên {src_name}...")
-        # Search theo nguồn đã chọn
         try:
             fn = _search_yt if source == "yt" else _search_sc
             tracks = await asyncio.get_event_loop().run_in_executor(None, fn, query, 5)
@@ -1224,9 +1306,11 @@ async def on_cb(client: Client, cb: CallbackQuery):
             t.requester    = requester
             t.requester_id = requester_id
             t.is_video     = is_video
+        # Prefix callback để biết đây là RTMPS hay VC
+        kb_src = ("rtmps_" + source) if is_rtmps else source
         await cb.message.edit_text(
             f"🎬 **{query}** ({src_name}) — chọn:",
-            reply_markup=_search_kb(tracks, source),
+            reply_markup=_search_kb(tracks, kb_src),
         )
         _cache_set(cb.message.id, tracks)
         return
@@ -1240,6 +1324,37 @@ async def on_cb(client: Client, cb: CallbackQuery):
             return
         track = tracks[idx]
         _cache.pop(cb.message.id, None)
+
+        # ── Chế độ RTMPS: push lên livestream qua ffmpeg ──
+        if src.startswith("rtmps_"):
+            await cb.message.delete()
+            await cb.answer(f"📡 Đang phát lên live: {track.title[:25]}")
+            info = _rtmp_live.get(cid)
+            if not info:
+                await client.send_message(cid, "❌ Live Stream chưa mở. Gõ /setrtmps trước.")
+                return
+            st_msg = await client.send_message(cid, f"📡 Đang lấy video **{track.title}**...")
+            try:
+                # Lấy URL video+audio để push
+                audio_url, video_url = await asyncio.get_event_loop().run_in_executor(
+                    None, _get_video_urls, track
+                )
+                # Dừng ffmpeg cũ nếu đang chạy
+                _rtmp_stop(cid)
+                # Push lên RTMP — ưu tiên video_url (đã có cả tiếng nếu muxed)
+                # Dùng video_url làm input chính
+                proc = _rtmp_push(video_url, info["url"], info["key"], is_video=True)
+                info["proc"] = proc
+                await st_msg.edit(
+                    f"🔴 **ĐANG PHÁT LIVE:** {track.title}\n"
+                    f"👤 {track.requester}\n"
+                    f"Mọi người mở livestream của group để xem!"
+                )
+            except Exception as e:
+                await st_msg.edit(f"❌ Lỗi push live: {e}")
+            return
+
+        # ── Chế độ VC bình thường ──
         await cb.message.delete()
         await cb.answer(f"✅ {track.title[:25]}")
         if g.current:
