@@ -124,20 +124,19 @@ def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
 
     is_hls = ".m3u8" in (video_url or "").lower()
 
-    # Input flags — buffer lớn để chịu được KKPhim trả segment chậm
+    # Input flags — buffer lớn chống lag, KHÔNG reconnect_at_eof (gây kẹt HLS)
     rc = [
-        "-reconnect", "1", "-reconnect_at_eof", "1",
-        "-reconnect_streamed", "1", "-reconnect_delay_max", "30",
+        "-reconnect", "1", "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
         "-thread_queue_size", "16384",
-        "-analyzeduration", "15000000", "-probesize", "15000000",
+        "-analyzeduration", "10000000", "-probesize", "10000000",
         "-user_agent", "Mozilla/5.0",
-        # Buffer đọc 50MB — tải trước nhiều segment, chống lag khi server chậm
         "-rtbufsize", "50M",
     ]
     if is_hls:
         rc = ["-protocol_whitelist", "file,http,https,tcp,tls,crypto,hls"] + rc
-        rc = rc + ["-m3u8_hold_counters", "20", "-max_reload", "1000",
-                   "-http_persistent", "1", "-http_multiple", "1"]
+        # http_persistent=0 để mỗi segment mở kết nối mới (tránh kẹt EOF)
+        rc = rc + ["-http_persistent", "0", "-m3u8_hold_counters", "10"]
     else:
         rc = rc + ["-rw_timeout", "30000000"]
 
