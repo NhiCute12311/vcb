@@ -76,13 +76,25 @@ BOT_TOKEN = "8254987879:AAGCLxCes79aDF6rGsZl1L4oPZUfTqj7uw0"
 ADMIN_USERNAME = "neweixyz"   # không có @
 
 # Whitelist: tập user_id được skip bất kỳ bài nào (như admin)
-# Lưu theo từng group: {chat_id: set(user_id)}
 _whitelist: dict[int, set] = {}
+# Banlist: tập user_id bị cấm dùng bot
+_banlist: dict[int, set] = {}
 
 def _get_wl(cid: int) -> set:
     if cid not in _whitelist:
         _whitelist[cid] = set()
     return _whitelist[cid]
+
+def _get_ban(cid: int) -> set:
+    if cid not in _banlist:
+        _banlist[cid] = set()
+    return _banlist[cid]
+
+def _is_banned(cid: int, user_id: int, username: str = "") -> bool:
+    # Admin tối cao không bao giờ bị ban
+    if username and username.lower() == ADMIN_USERNAME.lower():
+        return False
+    return user_id in _get_ban(cid)
 
 async def _is_privileged(client, cid: int, user_id: int, username: str = "") -> bool:
     """True nếu là admin tối cao hoặc trong whitelist."""
@@ -95,6 +107,19 @@ async def _is_privileged(client, cid: int, user_id: int, username: str = "") -> 
     return False
 
 # ══════════════════════════════════════════════════
+
+async def _can_skip(client, cid: int, user_id: int, username: str, current_requester_id: int) -> bool:
+    """True nếu được phép skip: là người chọn bài, admin, hoặc whitelist."""
+    # Admin tối cao
+    if username and username.lower() == ADMIN_USERNAME.lower():
+        return True
+    # Người chọn bài hiện tại
+    if current_requester_id and current_requester_id == user_id:
+        return True
+    # Trong whitelist
+    if user_id in _get_wl(cid):
+        return True
+    return False
 
 # ══════════════════════════════════════════════════
 #  Data classes
@@ -164,6 +189,21 @@ _CLIENT_SETS = [
     ["mweb"],
 ]
 
+def _fresh_cookie_copy():
+    """yt-dlp GHI ĐÈ cookiefile sau mỗi request → làm hỏng cookies gốc.
+    Giải pháp: mỗi lần tạo 1 bản copy tạm, yt-dlp chỉ phá bản copy,
+    cookies gốc (cookies.txt) luôn nguyên vẹn."""
+    if not _COOKIES_FILE or not os.path.exists(_COOKIES_FILE):
+        return None
+    try:
+        import tempfile
+        tmp = os.path.join(tempfile.gettempdir(), "ck_work.txt")
+        _shutil.copy2(_COOKIES_FILE, tmp)
+        return tmp
+    except Exception as e:
+        log.warning("Không copy được cookies: %s", e)
+        return _COOKIES_FILE
+
 def _yt_opts(extra: dict = {}, clients=None) -> dict:
     opts = {
         "quiet":        True,
@@ -176,8 +216,10 @@ def _yt_opts(extra: dict = {}, clients=None) -> dict:
         },
         **extra
     }
-    if _COOKIES_FILE:
-        opts["cookiefile"] = _COOKIES_FILE
+    # Dùng BẢN COPY của cookies, không dùng file gốc
+    ck = _fresh_cookie_copy()
+    if ck:
+        opts["cookiefile"] = ck
     if _FFMPEG_LOC:
         opts["ffmpeg_location"] = _FFMPEG_LOC
     return opts
@@ -249,7 +291,8 @@ def _get_stream_url(track: Track) -> str:
             else:
                 log.warning("Client %s lỗi: %s", clients, e)
                 continue
-    raise Exception(f"Tất cả client đều bị chặn: {last_err}")
+    # Tất cả client bị chặn = cookies hết hạn hoặc IP bị block
+    raise Exception("COOKIES_EXPIRED")
 
 def _pick_video(info):
     formats = info.get("formats", [])
@@ -485,10 +528,12 @@ async def _play_next(client: Client, cid: int):
     except Exception as e:
         log.error("_play_next error: %s", e)
         err_low = str(e).lower()
-        if "no active" in err_low or "groupcall" in err_low or "not found" in err_low or "bot_method" in err_low or "invalid" in err_low:
+        if "no active" in err_low or "groupcall" in err_low or "not found" in err_low or "bot_method" in err_low or "invalid" in err_low or "no group call" in err_low:
+            # VC không tồn tại/đã đóng → reset sạch, không giữ queue cũ
+            await _reset_state(cid, "no active VC")
             await client.send_message(
                 cid,
-                "❌ Chua co Voice Chat! Vao group → Voice Chat → Start Voice Chat → roi /play lai"
+                "❌ Chưa có Voice Chat đang mở! Mở VC trong group rồi /play lại.\n(Đã xoá hàng chờ cũ)"
             )
         elif "connection" in err_low or "lost" in err_low or "timeout" in err_low:
             # Connection lost — thử rejoin và phát lại bài hiện tại
@@ -507,8 +552,17 @@ async def _play_next(client: Client, cid: int):
                 if g.queue:
                     g.current = None
                     await _play_next(client, cid)
+        elif "cookies_expired" in err_low or "sign in" in err_low or "confirm" in err_low:
+            # Cookies hết hạn — báo rõ và dừng, không spam queue
+            await _reset_state(cid, "cookies expired")
+            await client.send_message(
+                cid,
+                "🍪 **Cookies YouTube đã hết hạn!**\n"
+                "Admin cần gửi file `cookies.txt` mới kèm lệnh `/updatecookies`.\n"
+                "(Đã xoá hàng chờ để tránh lỗi)"
+            )
         else:
-            await client.send_message(cid, f"❌ Lỗi phát nhạc: bỏ qua bài này.")
+            await client.send_message(cid, "❌ Lỗi phát bài này, bỏ qua.")
             if g.queue:
                 g.current = None
                 await _play_next(client, cid)
@@ -517,6 +571,30 @@ async def _play_next(client: Client, cid: int):
 #  Stream end event handler
 #  Tương thích cả version cũ lẫn mới của py-tgcalls
 # ══════════════════════════════════════════════════
+async def _reset_state(cid: int, reason: str = ""):
+    """Xoá sạch hàng chờ + trạng thái khi VC đóng/stop."""
+    g = st(cid)
+    g.queue.clear()
+    g.current    = None
+    g.loop       = False
+    g.paused     = False
+    g.is_playing = False
+    # Xoá file tạm
+    if g.tmp_file and os.path.isfile(g.tmp_file):
+        try:
+            import shutil
+            shutil.rmtree(os.path.dirname(g.tmp_file), ignore_errors=True)
+        except Exception:
+            pass
+    g.tmp_file = ""
+    if g.np_msg:
+        try:
+            await bot.delete_messages(cid, g.np_msg)
+        except Exception:
+            pass
+        g.np_msg = 0
+    log.info("State reset in %d (%s)", cid, reason)
+
 @calls.on_update()
 async def _on_update(_, update):
     try:
@@ -527,40 +605,55 @@ async def _on_update(_, update):
     cls = type(update).__name__
     log.info("VC update: %s in %d", cls, cid)
 
-    # CHỈ trigger khi stream thật sự kết thúc
-    # Bỏ qua TẤT CẢ các update khác
-    should_next = False
+    # ── VC bị đóng (người tắt voice chat) → reset toàn bộ ──
+    if cls in ("ClosedVoiceChat", "GroupCallClosed", "Closed", "LeftGroupCall",
+               "LeftVoiceChat", "KickedFromGroupCall"):
+        log.info("VC closed (%s) in %d → reset", cls, cid)
+        try:
+            await calls.leave_call(cid)
+        except Exception:
+            pass
+        await _reset_state(cid, "VC closed")
+        try:
+            await bot.send_message(cid, "⏹ Voice Chat đã đóng — đã xoá hàng chờ.")
+        except Exception:
+            pass
+        return
 
+    # ── Stream kết thúc bình thường → phát bài tiếp ──
+    should_next = False
     if _HAS_STREAM_EVENTS:
-        # Dùng isinstance chính xác nhất
         if isinstance(update, StreamAudioEnded):
             should_next = True
-            log.info("StreamAudioEnded detected")
         elif isinstance(update, StreamVideoEnded):
             should_next = True
-            log.info("StreamVideoEnded detected")
-    else:
-        # Chỉ match đúng class name — tránh false positive
-        if cls in ("StreamAudioEnded", "StreamVideoEnded", "StreamEnded"):
-            should_next = True
+    if cls in ("StreamAudioEnded", "StreamVideoEnded", "StreamEnded"):
+        should_next = True
 
     if should_next:
         import time as _time
         g = st(cid)
         elapsed = _time.time() - getattr(g, "_play_start", 0)
         log.info("StreamEnded: is_playing=%s elapsed=%.1fs", g.is_playing, elapsed)
-        # Bỏ qua nếu mới play < 3 giây (StreamEnded giả)
         if g.current and g.is_playing and elapsed > 5:
             g.is_playing = False
-            log.info("Stream ended → next track in %d", cid)
+            log.info("Stream ended → next in %d", cid)
             await _play_next(bot, cid)
         else:
-            log.info("StreamEnded ignored (too soon or not playing)")
+            log.info("StreamEnded ignored (too soon)")
 
 # ══════════════════════════════════════════════════
 #  Search result cache + keyboard
 # ══════════════════════════════════════════════════
 _cache: dict[int, list[Track]] = {}
+
+def _cache_set(mid, tracks):
+    """Lưu kết quả tìm kiếm, giới hạn 50 entry để không leak RAM."""
+    _cache[mid] = tracks
+    if len(_cache) > 50:
+        # Xoá entry cũ nhất
+        oldest = next(iter(_cache))
+        _cache.pop(oldest, None)
 
 def _search_kb(tracks: list[Track], src: str) -> InlineKeyboardMarkup:
     rows = [
@@ -592,9 +685,77 @@ async def cmd_start(_, msg: Message):
         "**Admin:**\n"
         "`/wl @user`       — Cho phép skip mọi bài\n"
         "`/unwl @user`     — Gỡ quyền skip\n"
-        "`/wllist`         — Xem danh sách whitelist\n\n"
+        "`/wllist`         — Xem whitelist\n"
+        "`/bl @user`       — Blacklist (cấm dùng bot)\n"
+        "`/unbl @user`     — Gỡ blacklist\n\n"
         "⚠️ Group phải có **Voice Chat đang mở** trước khi dùng."
     )
+
+# ── Chặn user bị ban TRƯỚC mọi lệnh khác ──────────
+@app.on_message(filters.command([
+    "play", "video", "skip", "stop", "pause", "resume",
+    "queue", "np", "loop", "clear"
+]) & filters.group, group=-2)
+async def _ban_guard(client: Client, msg: Message):
+    if not msg.from_user:
+        return
+    uid   = msg.from_user.id
+    uname = msg.from_user.username or ""
+    if _is_banned(msg.chat.id, uid, uname):
+        try:
+            await msg.reply("🚫 Bạn đã bị cấm sử dụng bot trong group này.")
+        except Exception:
+            pass
+        msg.stop_propagation()   # chặn không cho lệnh chạy tiếp
+
+@app.on_message(filters.command(["blacklist", "bl"]) & filters.group)
+async def cmd_blacklist(client: Client, msg: Message):
+    uname = msg.from_user.username if msg.from_user else ""
+    if not (uname and uname.lower() == ADMIN_USERNAME.lower()):
+        await msg.reply("❌ Chỉ admin mới được blacklist.")
+        return
+    target_id = None; target_name = ""
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id   = msg.reply_to_message.from_user.id
+        target_name = msg.reply_to_message.from_user.first_name
+    elif len(msg.command) > 1:
+        u = msg.command[1].lstrip("@")
+        try:
+            usr = await client.get_users(u)
+            target_id = usr.id; target_name = usr.first_name
+        except Exception:
+            await msg.reply(f"❌ Không tìm thấy @{u}")
+            return
+    if not target_id:
+        await msg.reply("Dùng: reply tin nhắn + `/bl`, hoặc `/bl @username`")
+        return
+    _get_ban(msg.chat.id).add(target_id)
+    _get_wl(msg.chat.id).discard(target_id)  # ban thì gỡ whitelist
+    await msg.reply(f"🚫 Đã blacklist **{target_name}** — không dùng được bot.")
+
+@app.on_message(filters.command(["unblacklist", "unbl"]) & filters.group)
+async def cmd_unblacklist(client: Client, msg: Message):
+    uname = msg.from_user.username if msg.from_user else ""
+    if not (uname and uname.lower() == ADMIN_USERNAME.lower()):
+        await msg.reply("❌ Chỉ admin mới được gỡ blacklist.")
+        return
+    target_id = None; target_name = ""
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id   = msg.reply_to_message.from_user.id
+        target_name = msg.reply_to_message.from_user.first_name
+    elif len(msg.command) > 1:
+        u = msg.command[1].lstrip("@")
+        try:
+            usr = await client.get_users(u)
+            target_id = usr.id; target_name = usr.first_name
+        except Exception:
+            await msg.reply(f"❌ Không tìm thấy @{u}")
+            return
+    if not target_id:
+        await msg.reply("Dùng: reply tin nhắn + `/unbl`, hoặc `/unbl @username`")
+        return
+    _get_ban(msg.chat.id).discard(target_id)
+    await msg.reply(f"✅ Đã gỡ blacklist **{target_name}**.")
 
 @app.on_message(filters.command("play") & filters.group)
 async def cmd_play(client: Client, msg: Message):
@@ -618,7 +779,7 @@ async def cmd_play(client: Client, msg: Message):
         t.requester_id = requester_id
     await s.delete()
     m = await msg.reply(f"🎵 **{q}** — chọn bài:", reply_markup=_search_kb(tracks, "yt"))
-    _cache[m.id] = tracks
+    _cache_set(m.id, tracks)
 
 @app.on_message(filters.command("video") & filters.group)
 async def cmd_video(client: Client, msg: Message):
@@ -643,7 +804,7 @@ async def cmd_video(client: Client, msg: Message):
         t.is_video     = True
     await s.delete()
     m = await msg.reply(f"🎬 **{q}** — chọn video:", reply_markup=_search_kb(tracks, "yt"))
-    _cache[m.id] = tracks
+    _cache_set(m.id, tracks)
 
 @app.on_message(filters.command("skip") & filters.group)
 async def cmd_skip(client: Client, msg: Message):
@@ -655,12 +816,11 @@ async def cmd_skip(client: Client, msg: Message):
     user_id  = msg.from_user.id if msg.from_user else 0
     username = msg.from_user.username if msg.from_user else ""
 
-    # Người yêu cầu bài HOẶC admin/whitelist được skip
-    is_owner = (g.current.requester_id == user_id)
-    is_priv  = await _is_privileged(client, msg.chat.id, user_id, username)
-
-    if not is_owner and not is_priv:
-        await msg.reply(f"❌ Chỉ **{g.current.requester}** (người yêu cầu) hoặc người có quyền mới được skip!")
+    allowed = await _can_skip(client, msg.chat.id, user_id, username, g.current.requester_id)
+    log.info("Skip cmd by %s(id=%d): allowed=%s (requester=%d, wl=%s)",
+             username or user_id, user_id, allowed, g.current.requester_id, user_id in _get_wl(msg.chat.id))
+    if not allowed:
+        await msg.reply(f"❌ Chỉ **{g.current.requester}** (người chọn bài), admin, hoặc whitelist mới được skip!")
         return
 
     title  = g.current.title
@@ -857,6 +1017,12 @@ async def on_cb(client: Client, cb: CallbackQuery):
     cid  = cb.message.chat.id
     g    = st(cid)
 
+    # Chặn user bị blacklist
+    bl_uname = cb.from_user.username or ""
+    if _is_banned(cid, cb.from_user.id, bl_uname):
+        await cb.answer("🚫 Bạn đã bị blacklist, không dùng được bot.", show_alert=True)
+        return
+
     # ── Chọn bài từ kết quả tìm kiếm ──────────────
     if data.startswith("pick|"):
         _, src, idx_s = data.split("|")
@@ -909,10 +1075,11 @@ async def on_cb(client: Client, cb: CallbackQuery):
 
         user_id  = cb.from_user.id
         username = cb.from_user.username or ""
-        is_owner = (g.current.requester_id == user_id)
-        is_priv  = await _is_privileged(client, cid, user_id, username)
-        if not is_owner and not is_priv:
-            await cb.answer(f"❌ Chỉ {g.current.requester} hoặc người có quyền mới được skip!", show_alert=True)
+        allowed  = await _can_skip(client, cid, user_id, username, g.current.requester_id)
+        log.info("Skip btn by %s(id=%d): allowed=%s (requester=%d, wl=%s)",
+                 username or user_id, user_id, allowed, g.current.requester_id, user_id in _get_wl(cid))
+        if not allowed:
+            await cb.answer(f"❌ Chỉ {g.current.requester} (người chọn bài), admin, hoặc whitelist mới được skip!", show_alert=True)
             return
 
         await cb.answer(f"⏭ {g.current.title[:20]}")
@@ -1050,3 +1217,4 @@ if __name__ == "__main__":
                 import time; time.sleep(5)
             else:
                 import time; time.sleep(15)
+
