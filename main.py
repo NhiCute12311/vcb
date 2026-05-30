@@ -258,14 +258,16 @@ def _find_ffmpeg():
 
 _FFMPEG_LOC = _find_ffmpeg()
 
-# Các client để thử lần lượt khi 1 cái bị YouTube chặn
+# Các client thử lần lượt. Khi CÓ cookies, web/tv/mweb hoạt động tốt nhất.
+# android/ios giờ cần PO token nên để cuối.
 _CLIENT_SETS = [
-    ["android"],
-    ["ios"],
-    ["tv_embedded"],
-    ["web_safari"],
-    ["android", "web"],
+    ["web"],
     ["mweb"],
+    ["tv"],
+    ["web_embedded"],
+    ["web_safari"],
+    ["ios"],
+    ["android"],
 ]
 
 def _fresh_cookie_copy():
@@ -275,8 +277,8 @@ def _fresh_cookie_copy():
     if not _COOKIES_FILE or not os.path.exists(_COOKIES_FILE):
         return None
     try:
-        import tempfile
-        tmp = os.path.join(tempfile.gettempdir(), "ck_work.txt")
+        import tempfile, uuid
+        tmp = os.path.join(tempfile.gettempdir(), f"ck_{uuid.uuid4().hex[:8]}.txt")
         _shutil.copy2(_COOKIES_FILE, tmp)
         return tmp
     except Exception as e:
@@ -290,7 +292,7 @@ def _yt_opts(extra: dict = {}, clients=None) -> dict:
         "nocheckcertificate": True,
         "extractor_args": {
             "youtube": {
-                "player_client": clients or ["android", "web"],
+                "player_client": clients or ["web", "mweb"],
             }
         },
         **extra
@@ -1507,9 +1509,19 @@ async def _start():
     log.info("✅ PyTgCalls sẵn sàng — Bot đang chạy!")
 
 async def _watchdog():
-    """Ping Telegram mỗi 60s để giữ kết nối."""
+    """Ping Telegram mỗi 60s + dọn file cookie tạm."""
     while True:
         await asyncio.sleep(60)
+        # Dọn file cookie tạm cũ (ck_*.txt) để không leak disk
+        try:
+            import tempfile, glob as _g
+            for f in _g.glob(os.path.join(tempfile.gettempdir(), "ck_*.txt")):
+                try:
+                    os.remove(f)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             await userbot.get_me()
             await bot.get_me()
