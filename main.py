@@ -440,9 +440,27 @@ async def _play_next(client: Client, cid: int):
                 cid,
                 "❌ Chua co Voice Chat! Vao group → Voice Chat → Start Voice Chat → roi /play lai"
             )
+        elif "connection" in err_low or "lost" in err_low or "timeout" in err_low:
+            # Connection lost — thử rejoin và phát lại bài hiện tại
+            log.warning("Connection lost, retrying in 5s...")
+            await asyncio.sleep(5)
+            try:
+                stream_url = await asyncio.get_event_loop().run_in_executor(None, _get_stream_url, track)
+                ms = MediaStream(stream_url, ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 3")
+                import time as _t
+                g._play_start = _t.time()
+                g.is_playing = True
+                await calls.play(cid, ms)
+                log.info("Reconnected and replaying: %s", track.title)
+            except Exception as e2:
+                log.error("Retry failed: %s", e2)
+                if g.queue:
+                    g.current = None
+                    await _play_next(client, cid)
         else:
-            await client.send_message(cid, f"❌ Lỗi phát nhạc: `{e}`\nBỏ qua, thử bài tiếp…")
+            await client.send_message(cid, f"❌ Lỗi phát nhạc: bỏ qua bài này.")
             if g.queue:
+                g.current = None
                 await _play_next(client, cid)
 
 # ══════════════════════════════════════════════════
@@ -879,11 +897,32 @@ async def _start():
     await calls.start()
     log.info("✅ PyTgCalls sẵn sàng — Bot đang chạy!")
 
+async def _watchdog():
+    """Ping Telegram mỗi 60s để giữ kết nối."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await userbot.get_me()
+            await bot.get_me()
+        except Exception as e:
+            log.warning("Watchdog: kết nối yếu (%s), thử reconnect...", e)
+            try:
+                if not userbot.is_connected:
+                    await userbot.start()
+                if not bot.is_connected:
+                    await bot.start()
+                log.info("Watchdog: reconnected OK")
+            except Exception as re:
+                log.error("Watchdog reconnect failed: %s", re)
+
 async def main():
     log.info("Đang khởi động Voice Chat Bot…")
     await _start()
 
-    # Keepalive loop — tự reconnect khi mất kết nối
+    # Chạy watchdog ngầm
+    asyncio.create_task(_watchdog())
+
+    # Keepalive loop
     while True:
         try:
             await idle()
