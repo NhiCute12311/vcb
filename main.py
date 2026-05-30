@@ -43,6 +43,14 @@ from pytgcalls.types import MediaStream
 from pyrogram.raw.functions.phone import (
     CreateGroupCall, GetGroupCallStreamRtmpUrl, GetGroupCall, DiscardGroupCall
 )
+
+# Module xem phim (KKPhim API)
+try:
+    from phim_module import register_phim
+    _HAS_PHIM = True
+except Exception as _pe:
+    _HAS_PHIM = False
+    print(f"[phim] không load được module: {_pe}")
 try:
     from pytgcalls.types import AudioQuality, VideoQuality
     _HQ_AUDIO  = AudioQuality.HIGH
@@ -110,41 +118,39 @@ async def _rtmp_create_live(client, chat_id):
     return res.url, res.key
 
 def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
-    """Push video+audio lên RTMP server Telegram. Ghi log ffmpeg để debug."""
+    """Push video+audio lên RTMP Telegram — chống đơ, chất lượng cao 720p."""
     import subprocess
     target = rtmp_url.rstrip("/") + "/" + rtmp_key
 
-    rc = ["-reconnect", "1", "-reconnect_streamed", "1",
-          "-reconnect_delay_max", "5", "-rw_timeout", "15000000"]
+    # Chống đơ: reconnect mạnh + thread_queue lớn + analyzeduration cao
+    rc = [
+        "-reconnect", "1", "-reconnect_at_eof", "1",
+        "-reconnect_streamed", "1", "-reconnect_delay_max", "10",
+        "-rw_timeout", "30000000",
+        "-thread_queue_size", "4096",
+        "-analyzeduration", "10000000", "-probesize", "10000000",
+    ]
+    # Encode: chất lượng cao hơn (3500k, preset fast), keyframe đều chống giật
+    venc = [
+        "-c:v", "libx264", "-preset", "fast", "-tune", "zerolatency",
+        "-profile:v", "main", "-level", "4.0",
+        "-b:v", "3500k", "-maxrate", "3500k", "-bufsize", "7000k",
+        "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", "-keyint_min", "60",
+        "-sc_threshold", "0",
+        # scale về 720p cho nét + ổn định
+        "-vf", "scale=-2:720",
+    ]
+    aenc = ["-c:a", "aac", "-b:a", "160k", "-ar", "44100", "-ac", "2"]
+    flv = ["-f", "flv", "-flvflags", "no_duration_filesize", target]
 
     if audio_url and audio_url != video_url:
-        # 2 input riêng: video-only + audio-only → merge
-        cmd = [
-            "ffmpeg", "-re", *rc, "-i", video_url,
-            "-re", *rc, "-i", audio_url,
-            "-map", "0:v:0", "-map", "1:a:0",
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-profile:v", "baseline", "-level", "3.1",
-            "-b:v", "2000k", "-maxrate", "2000k", "-bufsize", "4000k",
-            "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", "-keyint_min", "60",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-            "-f", "flv", "-flvflags", "no_duration_filesize",
-            target,
-        ]
+        cmd = ["ffmpeg", "-re", *rc, "-i", video_url,
+               "-re", *rc, "-i", audio_url,
+               "-map", "0:v:0", "-map", "1:a:0", *venc, *aenc, *flv]
     else:
-        # 1 input muxed (có sẵn cả video+audio)
-        cmd = [
-            "ffmpeg", "-re", *rc, "-i", video_url,
-            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-            "-profile:v", "baseline", "-level", "3.1",
-            "-b:v", "2000k", "-maxrate", "2000k", "-bufsize", "4000k",
-            "-pix_fmt", "yuv420p", "-r", "30", "-g", "60", "-keyint_min", "60",
-            "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
-            "-f", "flv", "-flvflags", "no_duration_filesize",
-            target,
-        ]
+        cmd = ["ffmpeg", "-re", *rc, "-i", video_url, *venc, *aenc, *flv]
+
     log.info("FFmpeg push → %s", target[:55])
-    # Ghi log ffmpeg ra file để debug
     logf = open("/tmp/ffmpeg_rtmp.log", "w")
     return subprocess.Popen(cmd, stdout=logf, stderr=logf)
 
@@ -811,8 +817,11 @@ async def cmd_start(_, msg: Message):
         "`/playrtmp <link>`— Stream m3u8/RTMP/phim trực tiếp\n"
         "`/setrtmp <link>` — Lưu link RTMP mặc định\n"
         "`/setrtmps`       — Mở Live Stream 🔴 cho group\n"
-        "`/playrtmps <tên>`— Tìm video, chọn YT/SCL, phát lên live\n"
+        "`/playrtmps`      — Phát lên live: tên / link / reply voice-video\n"
         "`/stoprtmps`      — Dừng Live Stream\n"
+        "\n🎬 **Phim:**\n"
+        "`/xemphim`        — Mở kho phim (duyệt/tìm/chọn tập)\n"
+        "`/timphim <tên>`  — Tìm phim nhanh\n"
         "`/skip`           — Bỏ qua bài (chỉ người chọn bài)\n"
         "`/stop`           — Dừng và thoát VC\n"
         "`/pause` `/resume`— Tạm dừng / tiếp tục\n"
@@ -831,7 +840,7 @@ async def cmd_start(_, msg: Message):
 
 # ── Chặn user bị ban TRƯỚC mọi lệnh khác ──────────
 @app.on_message(filters.command([
-    "play", "video", "stream", "rtmp", "playrtmp", "playrtmps", "setrtmps", "stoprtmps", "fflog", "skip",
+    "play", "video", "stream", "rtmp", "playrtmp", "playrtmps", "setrtmps", "stoprtmps", "fflog", "xemphim", "timphim", "skip",
     "stop", "pause", "resume", "queue", "np", "loop", "clear"
 ]) & filters.group, group=-2)
 async def _ban_guard(client: Client, msg: Message):
@@ -1045,24 +1054,77 @@ async def cmd_setrtmps(client: Client, msg: Message):
         else:
             await s.edit(f"❌ Lỗi mở live: {err}")
 
+async def _ensure_live(client, cid):
+    """Đảm bảo đã mở live, nếu chưa thì tự mở."""
+    if cid in _rtmp_live:
+        return True
+    try:
+        url, key = await _rtmp_create_live(userbot, cid)
+        _rtmp_live[cid] = {"url": url, "key": key, "proc": None}
+        _rtmps_mode.add(cid)
+        return True
+    except Exception as e:
+        await client.send_message(cid, f"❌ Chưa mở được Live Stream: {e}\nGõ /setrtmps trước.")
+        return False
+
 @app.on_message(filters.command(["playrtmps"]) & filters.group)
 async def cmd_playrtmps(client: Client, msg: Message):
-    """Search video để stream — hiện 2 nút chọn nguồn YouTube/SoundCloud."""
-    q = " ".join(msg.command[1:]).strip()
-    if not q:
-        await msg.reply("❓ Dùng: `/playrtmps <tên video>`\nVD: `/playrtmps lofi hip hop`")
-        return
+    """Phát lên Live Stream. Hỗ trợ: tên video / link trực tiếp / reply voice-video."""
     cid = msg.chat.id
-    if cid not in _rtmp_live:
-        await msg.reply("❌ Chưa mở Live Stream! Gõ `/setrtmps` trước.")
-        return
     requester    = msg.from_user.first_name if msg.from_user else "?"
     requester_id = msg.from_user.id if msg.from_user else 0
+
+    # ── 1. Reply tin nhắn có voice/audio/video → phát file đó ──
+    reply = msg.reply_to_message
+    if reply and (reply.voice or reply.audio or reply.video or reply.video_note or reply.document):
+        if not await _ensure_live(client, cid):
+            return
+        s = await msg.reply("📥 Đang tải media từ tin nhắn...")
+        try:
+            fpath = await client.download_media(reply)
+            info = _rtmp_live[cid]
+            _rtmp_stop(cid)
+            proc = _rtmp_push(fpath, fpath, info["url"], info["key"])
+            info["proc"] = proc
+            await s.edit("🔴 **ĐANG PHÁT LIVE** từ file Telegram!\nMọi người mở livestream để xem/nghe.")
+        except Exception as e:
+            await s.edit(f"❌ Lỗi phát file: {e}")
+        return
+
+    q = " ".join(msg.command[1:]).strip()
+    if not q:
+        await msg.reply(
+            "❓ **Dùng /playrtmps theo 3 cách:**\n\n"
+            "1️⃣ `/playrtmps <tên video>` — tìm trên YouTube/SoundCloud\n"
+            "2️⃣ `/playrtmps <link>` — phát link trực tiếp\n"
+            "3️⃣ Reply 1 tin nhắn có voice/video + `/playrtmps`\n\n"
+            "**Link hỗ trợ:** m3u8/HLS, RTMP/RTMPS, mp4/mkv/ts, "
+            "YouTube, SoundCloud, và đa số link video trực tiếp."
+        )
+        return
+
+    # ── 2. Là link trực tiếp → phát thẳng ──
+    if _valid_stream_url(q):
+        if not await _ensure_live(client, cid):
+            return
+        s = await msg.reply("📡 Đang phát link lên Live...")
+        try:
+            info = _rtmp_live[cid]
+            _rtmp_stop(cid)
+            proc = _rtmp_push(q, q, info["url"], info["key"])
+            info["proc"] = proc
+            await s.edit(f"🔴 **ĐANG PHÁT LIVE** từ link!\nMọi người mở livestream để xem.")
+        except Exception as e:
+            await s.edit(f"❌ Lỗi phát link: {e}")
+        return
+
+    # ── 3. Là tên → search, chọn nguồn ──
+    if not await _ensure_live(client, cid):
+        return
     m = await msg.reply(
         f"🔍 **{q}**\nChọn nguồn để tìm video:",
         reply_markup=_source_kb(),
     )
-    # tuple thứ 5 = True nghĩa là chế độ RTMPS (push live)
     _pending_src[m.id] = (q, True, requester, requester_id, True)
 
 @app.on_message(filters.command(["stoprtmps"]) & filters.group)
@@ -1536,6 +1598,50 @@ async def _watchdog():
             except Exception as re:
                 log.error("Watchdog reconnect failed: %s", re)
 
+async def _phim_on_play(client, chat_id, title, m3u8_url, mode):
+    """Callback cho module phim: phát phim vào VC (vplay) hoặc livestream (rtmps)."""
+    if mode == "rtmps":
+        # Phát lên Telegram Live Stream
+        info = _rtmp_live.get(chat_id)
+        if not info:
+            # Tự mở live nếu chưa mở
+            try:
+                url, key = await _rtmp_create_live(userbot, chat_id)
+                _rtmp_live[chat_id] = {"url": url, "key": key, "proc": None}
+                _rtmps_mode.add(chat_id)
+                info = _rtmp_live[chat_id]
+            except Exception as e:
+                await client.send_message(chat_id, f"❌ Chưa mở được Live Stream: {e}\nGõ /setrtmps trước.")
+                return
+        st_msg = await client.send_message(chat_id, f"📡 Đang phát phim lên Live: **{title}**...")
+        try:
+            _rtmp_stop(chat_id)
+            # m3u8 phim đã có cả video+audio → dùng làm input duy nhất
+            proc = _rtmp_push(m3u8_url, m3u8_url, info["url"], info["key"])
+            info["proc"] = proc
+            await st_msg.edit(f"🔴 **ĐANG PHÁT LIVE:** {title}\nMọi người mở livestream của group để xem!")
+        except Exception as e:
+            await st_msg.edit(f"❌ Lỗi push live: {e}")
+    else:
+        # vplay — phát vào Voice Chat
+        track = Track(
+            title=title, url=m3u8_url, duration=0,
+            requester="Phim", requester_id=0,
+            is_video=True, is_direct=True,
+        )
+        g = st(chat_id)
+        if g.current:
+            g.queue.append(track)
+            await client.send_message(chat_id, f"➕ **{title}** → hàng chờ #{len(g.queue)}")
+        else:
+            g.queue.append(track)
+            await _play_next(client, chat_id)
+
+# Đăng ký module phim
+if _HAS_PHIM:
+    register_phim(app, _phim_on_play, ban_check=_is_banned)
+    log.info("✅ Module /xemphim đã đăng ký")
+
 async def main():
     log.info("Đang khởi động Voice Chat Bot…")
     await _start()
@@ -1580,4 +1686,3 @@ if __name__ == "__main__":
                 import time; time.sleep(5)
             else:
                 import time; time.sleep(15)
-
