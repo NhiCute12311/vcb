@@ -164,6 +164,30 @@ def _rtmp_push(video_url: str, audio_url: str, rtmp_url: str, rtmp_key: str):
     logf = open("/tmp/ffmpeg_rtmp.log", "w")
     return subprocess.Popen(cmd, stdout=logf, stderr=logf)
 
+def _url_alive(url: str) -> bool:
+    """Kiểm tra link còn sống (không 404) trước khi push."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, method="HEAD",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return r.status < 400
+    except Exception as e:
+        # HEAD có thể bị chặn — thử GET 1 byte
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-1"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                return r.status < 400
+        except Exception:
+            return False
+
+def _ffmpeg_alive_after(proc, seconds=4) -> bool:
+    """True nếu ffmpeg còn sống sau N giây (không chết vì lỗi link)."""
+    import time as _t
+    _t.sleep(seconds)
+    return proc.poll() is None
+
 def _rtmp_stop(chat_id):
     """Dừng ffmpeg process của group."""
     info = _rtmp_live.get(chat_id)
@@ -1461,15 +1485,16 @@ async def on_cb(client: Client, cb: CallbackQuery):
                 return
             st_msg = await client.send_message(cid, f"📡 Đang lấy video **{track.title}**...")
             try:
-                # Lấy URL video+audio để push
                 audio_url, video_url = await asyncio.get_event_loop().run_in_executor(
                     None, _get_video_urls, track
                 )
-                # Dừng ffmpeg cũ nếu đang chạy
                 _rtmp_stop(cid)
-                # Push lên RTMP với cả video + audio
                 proc = _rtmp_push(video_url, audio_url, info["url"], info["key"])
                 info["proc"] = proc
+                ok = await asyncio.get_event_loop().run_in_executor(None, _ffmpeg_alive_after, proc, 4)
+                if not ok:
+                    await st_msg.edit("❌ Không phát được (ffmpeg dừng ngay). Thử bài khác. /fflog để xem lỗi.")
+                    return
                 await st_msg.edit(
                     f"🔴 **ĐANG PHÁT LIVE:** {track.title}\n"
                     f"👤 {track.requester}\n"
@@ -1632,12 +1657,28 @@ async def _phim_on_play(client, chat_id, title, m3u8_url, mode):
             except Exception as e:
                 await client.send_message(chat_id, f"❌ Chưa mở được Live Stream: {e}\nGõ /setrtmps trước.")
                 return
-        st_msg = await client.send_message(chat_id, f"📡 Đang phát phim lên Live: **{title}**...")
+        st_msg = await client.send_message(chat_id, f"📡 Đang kiểm tra link phim...")
+        # Kiểm tra link còn sống không (tránh 404)
+        alive = await asyncio.get_event_loop().run_in_executor(None, _url_alive, m3u8_url)
+        if not alive:
+            await st_msg.edit(
+                "❌ **Link tập phim này đã hết hạn (404).**\n"
+                "Thử chọn **server khác** hoặc **tập khác** — nguồn KKPhim đôi khi đổi link."
+            )
+            return
         try:
             _rtmp_stop(chat_id)
-            # m3u8 phim đã có cả video+audio → dùng làm input duy nhất
+            await st_msg.edit(f"📡 Đang phát lên Live: **{title}**...")
             proc = _rtmp_push(m3u8_url, m3u8_url, info["url"], info["key"])
             info["proc"] = proc
+            # Kiểm tra ffmpeg sống sau 4s (nếu chết = link lỗi)
+            ok = await asyncio.get_event_loop().run_in_executor(None, _ffmpeg_alive_after, proc, 4)
+            if not ok:
+                await st_msg.edit(
+                    "❌ **Không phát được tập này** (ffmpeg dừng ngay).\n"
+                    "Link có thể hỏng — thử server/tập khác. Gõ /fflog để xem chi tiết."
+                )
+                return
             await st_msg.edit(f"🔴 **ĐANG PHÁT LIVE:** {title}\nMọi người mở livestream của group để xem!")
         except Exception as e:
             await st_msg.edit(f"❌ Lỗi push live: {e}")
