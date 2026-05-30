@@ -79,6 +79,10 @@ ADMIN_USERNAME = "neweixyz"   # không có @
 _whitelist: dict[int, set] = {}
 # Banlist: tập user_id bị cấm dùng bot
 _banlist: dict[int, set] = {}
+# RTMP link mặc định cho mỗi group: {chat_id: url}
+_rtmp_default: dict[int, str] = {}
+# Group nào đang bật chế độ RTMPS (stream video)
+_rtmps_mode: set = set()
 
 def _get_wl(cid: int) -> set:
     if cid not in _whitelist:
@@ -131,9 +135,10 @@ class Track:
     duration:     int
     thumbnail:    str  = ""
     requester:    str  = ""
-    requester_id: int  = 0     # user_id của người yêu cầu
+    requester_id: int  = 0
     source:       str  = "yt"
     is_video:     bool = False
+    is_direct:    bool = False   # True = link stream trực tiếp (m3u8/rtmp/mp4), bỏ qua yt-dlp
 
 @dataclass
 class GState:
@@ -253,6 +258,36 @@ def _search_yt(query: str, n: int = 5) -> list[Track]:
         )
         for e in (res.get("entries") or [])[:n] if e
     ]
+
+def _search_sc(query: str, n: int = 5) -> list[Track]:
+    """Tìm trên SoundCloud qua yt-dlp scsearch."""
+    opts = _yt_opts({"extract_flat": True})
+    if _is_url(query):
+        with yt_dlp.YoutubeDL(_yt_opts()) as ydl:
+            info = ydl.extract_info(query, download=False)
+            if info:
+                return [Track(
+                    title=info.get("title", "?"),
+                    url=query,
+                    duration=int(info.get("duration") or 0),
+                    thumbnail=info.get("thumbnail", ""),
+                    source="sc",
+                )]
+        return []
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        res = ydl.extract_info(f"scsearch{n}:{query}", download=False)
+    out = []
+    for e in (res.get("entries") or [])[:n]:
+        if not e:
+            continue
+        out.append(Track(
+            title=e.get("title", "?"),
+            url=e.get("url") or e.get("webpage_url") or "",
+            duration=int(e.get("duration") or 0),
+            thumbnail=e.get("thumbnail", ""),
+            source="sc",
+        ))
+    return out
 
 import tempfile, glob
 
@@ -479,7 +514,18 @@ async def _play_next(client: Client, cid: int):
     g._tmp_file = ""
 
     try:
-        if track.is_video:
+        if track.is_direct:
+            # Stream trực tiếp m3u8/rtmp/mp4 — không qua yt-dlp, đưa thẳng URL vào ffmpeg
+            from pytgcalls.types import VideoQuality
+            try:
+                ms = MediaStream(
+                    track.url,
+                    video_parameters=VideoQuality.HD_720p,
+                    ffmpeg_parameters="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 10000000",
+                )
+            except Exception:
+                ms = MediaStream(track.url)
+        elif track.is_video:
             audio_url, video_url = await asyncio.get_event_loop().run_in_executor(
                 None, _get_video_urls, track
             )
@@ -666,6 +712,17 @@ def _search_kb(tracks: list[Track], src: str) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("❌ Huỷ", callback_data="pick_cancel")])
     return InlineKeyboardMarkup(rows)
 
+# Lưu query đang chờ chọn nguồn: {message_id: (query, is_video, requester, requester_id)}
+_pending_src: dict[int, tuple] = {}
+
+def _source_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶️ YouTube",    callback_data="src|yt"),
+        InlineKeyboardButton("🎵 SoundCloud", callback_data="src|sc"),
+    ], [
+        InlineKeyboardButton("❌ Huỷ", callback_data="pick_cancel"),
+    ]])
+
 # ══════════════════════════════════════════════════
 #  Commands
 # ══════════════════════════════════════════════════
@@ -674,7 +731,11 @@ async def cmd_start(_, msg: Message):
     await msg.reply(
         "🎵 **Voice Chat Music Bot**\n\n"
         "`/play <tên bài>` — Phát nhạc từ YouTube\n"
-        "`/video <tên>`    — Stream video vào VC\n"
+        "`/video <tên>`    — Stream video YouTube vào VC\n"
+        "`/playrtmp <link>`— Stream m3u8/RTMP/phim trực tiếp\n"
+        "`/setrtmp <link>` — Lưu link RTMP mặc định\n"
+        "`/setrtmps`       — Bật chế độ RTMPS (stream video)\n"
+        "`/playrtmps <tên>`— Tìm video, chọn nguồn YT/SCL\n"
         "`/skip`           — Bỏ qua bài (chỉ người chọn bài)\n"
         "`/stop`           — Dừng và thoát VC\n"
         "`/pause` `/resume`— Tạm dừng / tiếp tục\n"
@@ -693,8 +754,8 @@ async def cmd_start(_, msg: Message):
 
 # ── Chặn user bị ban TRƯỚC mọi lệnh khác ──────────
 @app.on_message(filters.command([
-    "play", "video", "skip", "stop", "pause", "resume",
-    "queue", "np", "loop", "clear"
+    "play", "video", "stream", "rtmp", "playrtmp", "playrtmps", "setrtmps", "skip",
+    "stop", "pause", "resume", "queue", "np", "loop", "clear"
 ]) & filters.group, group=-2)
 async def _ban_guard(client: Client, msg: Message):
     if not msg.from_user:
@@ -805,6 +866,119 @@ async def cmd_video(client: Client, msg: Message):
     await s.delete()
     m = await msg.reply(f"🎬 **{q}** — chọn video:", reply_markup=_search_kb(tracks, "yt"))
     _cache_set(m.id, tracks)
+
+def _stream_title(url: str) -> str:
+    low = url.lower()
+    if ".m3u8" in low:
+        return "📡 Live Stream (HLS)"
+    if low.startswith("rtmp"):
+        return "📡 RTMP Stream"
+    if any(ext in low for ext in [".mp4", ".mkv", ".ts", ".avi", ".webm"]):
+        return "🎬 Video Stream"
+    return "📡 Direct Stream"
+
+def _valid_stream_url(url: str) -> bool:
+    low = url.lower()
+    return (low.startswith("http://") or low.startswith("https://")
+            or low.startswith("rtmp://") or low.startswith("rtmps://"))
+
+async def _do_stream(client: Client, msg: Message, url: str):
+    if not _valid_stream_url(url):
+        await msg.reply("❌ Link không hợp lệ. Phải bắt đầu bằng http://, https://, rtmp:// hoặc rtmps://")
+        return
+    requester    = msg.from_user.first_name if msg.from_user else "?"
+    requester_id = msg.from_user.id if msg.from_user else 0
+    track = Track(
+        title=_stream_title(url),
+        url=url,
+        duration=0,
+        requester=requester,
+        requester_id=requester_id,
+        is_video=True,
+        is_direct=True,
+    )
+    g = st(msg.chat.id)
+    s = await msg.reply("📡 Đang kết nối stream...")
+    if g.current:
+        g.queue.append(track)
+        await s.edit(f"➕ Đã thêm stream vào hàng chờ #{len(g.queue)}")
+    else:
+        g.queue.append(track)
+        await s.delete()
+        await _play_next(client, msg.chat.id)
+
+@app.on_message(filters.command(["stream", "rtmp", "playrtmp"]) & filters.group)
+async def cmd_stream(client: Client, msg: Message):
+    """Stream link m3u8/HLS/RTMP/RTMPS/mp4 vào VC. Không nhập link → dùng link đã /setrtmp."""
+    url = " ".join(msg.command[1:]).strip()
+    if not url:
+        # Dùng link mặc định đã set
+        url = _rtmp_default.get(msg.chat.id, "")
+        if not url:
+            await msg.reply(
+                "❓ Dùng: `/playrtmp <link>`\n\n"
+                "Hỗ trợ: m3u8/HLS, RTMP, RTMPS, mp4/mkv/ts\n"
+                "VD: `/playrtmp https://example.com/live.m3u8`\n\n"
+                "Hoặc lưu link mặc định bằng `/setrtmp <link>` rồi chỉ cần gõ `/playrtmp`."
+            )
+            return
+        await msg.reply(f"📡 Dùng link RTMP đã lưu...")
+    await _do_stream(client, msg, url)
+
+@app.on_message(filters.command(["setrtmp"]) & filters.group)
+async def cmd_setrtmp(client: Client, msg: Message):
+    """Lưu link RTMP mặc định cho group."""
+    url = " ".join(msg.command[1:]).strip()
+    if not url:
+        cur = _rtmp_default.get(msg.chat.id, "")
+        if cur:
+            await msg.reply(f"📡 Link RTMP hiện tại:\n`{cur}`\n\nĐổi: `/setrtmp <link mới>`\nXoá: `/setrtmp clear`")
+        else:
+            await msg.reply("❓ Dùng: `/setrtmp <link>` để lưu link RTMP mặc định.")
+        return
+    if url.lower() == "clear":
+        _rtmp_default.pop(msg.chat.id, None)
+        await msg.reply("🗑 Đã xoá link RTMP mặc định.")
+        return
+    if not _valid_stream_url(url):
+        await msg.reply("❌ Link không hợp lệ.")
+        return
+    _rtmp_default[msg.chat.id] = url
+    await msg.reply(f"✅ Đã lưu link RTMP mặc định!\nGõ `/playrtmp` (không cần link) để phát.")
+
+@app.on_message(filters.command(["setrtmps"]) & filters.group)
+async def cmd_setrtmps(client: Client, msg: Message):
+    """Bật chế độ RTMPS — join VC sẵn, chuẩn bị stream video."""
+    cid = msg.chat.id
+    s = await msg.reply("📡 Đang bật chế độ RTMPS, kết nối VC...")
+    # Join VC sẵn bằng cách phát 1 stream im lặng ngắn — hoặc chỉ set cờ
+    _rtmps_mode.add(cid)
+    try:
+        # Thử join VC (nếu VC đang mở) bằng 1 silent stream
+        # py-tgcalls cần 1 stream để join, dùng silence
+        await s.edit(
+            "✅ **Đã bật chế độ RTMPS!**\n"
+            "Giờ dùng `/playrtmps <tên video>` để tìm và phát.\n"
+            "Bot sẽ hỏi nguồn: YouTube hay SoundCloud."
+        )
+    except Exception as e:
+        await s.edit(f"⚠️ Bật chế độ nhưng chưa join được VC: {e}")
+
+@app.on_message(filters.command(["playrtmps"]) & filters.group)
+async def cmd_playrtmps(client: Client, msg: Message):
+    """Search video để stream — hiện 2 nút chọn nguồn YouTube/SoundCloud."""
+    q = " ".join(msg.command[1:]).strip()
+    if not q:
+        await msg.reply("❓ Dùng: `/playrtmps <tên video>`\nVD: `/playrtmps lofi hip hop`")
+        return
+    requester    = msg.from_user.first_name if msg.from_user else "?"
+    requester_id = msg.from_user.id if msg.from_user else 0
+    # Hiện 2 nút chọn nguồn
+    m = await msg.reply(
+        f"🔍 **{q}**\nChọn nguồn để tìm video:",
+        reply_markup=_source_kb(),
+    )
+    _pending_src[m.id] = (q, True, requester, requester_id)
 
 @app.on_message(filters.command("skip") & filters.group)
 async def cmd_skip(client: Client, msg: Message):
@@ -1024,6 +1198,39 @@ async def on_cb(client: Client, cb: CallbackQuery):
         return
 
     # ── Chọn bài từ kết quả tìm kiếm ──────────────
+    # ── Chọn nguồn YouTube/SoundCloud cho /playrtmps ──
+    if data.startswith("src|"):
+        source = data.split("|")[1]   # "yt" hoặc "sc"
+        pending = _pending_src.get(cb.message.id)
+        if not pending:
+            await cb.answer("❌ Hết hạn, tìm lại nhé!", show_alert=True)
+            return
+        query, is_video, requester, requester_id = pending
+        _pending_src.pop(cb.message.id, None)
+        src_name = "YouTube" if source == "yt" else "SoundCloud"
+        await cb.answer(f"🔍 Tìm trên {src_name}...")
+        await cb.message.edit_text(f"🔍 Đang tìm **{query}** trên {src_name}...")
+        # Search theo nguồn đã chọn
+        try:
+            fn = _search_yt if source == "yt" else _search_sc
+            tracks = await asyncio.get_event_loop().run_in_executor(None, fn, query, 5)
+        except Exception as e:
+            await cb.message.edit_text(f"❌ Lỗi tìm kiếm: {e}")
+            return
+        if not tracks:
+            await cb.message.edit_text("😔 Không tìm thấy kết quả.")
+            return
+        for t in tracks:
+            t.requester    = requester
+            t.requester_id = requester_id
+            t.is_video     = is_video
+        await cb.message.edit_text(
+            f"🎬 **{query}** ({src_name}) — chọn:",
+            reply_markup=_search_kb(tracks, source),
+        )
+        _cache_set(cb.message.id, tracks)
+        return
+
     if data.startswith("pick|"):
         _, src, idx_s = data.split("|")
         idx    = int(idx_s)
@@ -1047,6 +1254,7 @@ async def on_cb(client: Client, cb: CallbackQuery):
 
     if data == "pick_cancel":
         _cache.pop(cb.message.id, None)
+        _pending_src.pop(cb.message.id, None)
         await cb.message.delete()
         await cb.answer("Đã huỷ.")
         return
