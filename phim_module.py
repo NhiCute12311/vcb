@@ -22,9 +22,13 @@ _film_cache: dict = {}
 # ── Gọi API ───────────────────────────────────────
 async def _api_get(path: str) -> dict:
     url = path if path.startswith("http") else (API_BASE + path)
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
-            return await r.json()
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    timeout = aiohttp.ClientTimeout(total=25)
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as s:
+        async with s.get(url) as r:
+            txt = await r.text()
+            import json
+            return json.loads(txt)
 
 async def api_phim_moi(page: int = 1) -> dict:
     return await _api_get(f"/danh-sach/phim-moi-cap-nhat?page={page}")
@@ -55,11 +59,17 @@ def _list_kb(items: list, page: int, total_pages: int, src: str) -> InlineKeyboa
     rows = []
     for it in items:
         slug = it.get("slug", "")
-        name = it.get("name", "?")
+        name = it.get("name") or it.get("origin_name") or "?"
         year = it.get("year", "")
         epc  = it.get("episode_current", "")
-        label = f"{name} • {year} | {epc}" if year else name
-        rows.append([InlineKeyboardButton(label[:50], callback_data=f"ph|film|{slug}")])
+        if year and epc:
+            label = f"{name} • {year} | {epc}"
+        elif year:
+            label = f"{name} • {year}"
+        else:
+            label = name
+        if slug:
+            rows.append([InlineKeyboardButton(label[:55], callback_data=f"ph|film|{slug}")])
     # Nút phân trang
     nav = []
     if page > 1:
@@ -196,8 +206,18 @@ def register_phim(app, on_play, ban_check=None):
         _film_cache[s.id] = {"search_kw": kw}
         await s.edit(f"🔍 Kết quả cho **{kw}**:", reply_markup=_list_kb(items, 1, 1, f"search|{kw}"))
 
-    @app.on_callback_query(filters.regex(r"^ph\|"))
+    @app.on_callback_query(filters.regex(r"^ph\|"), group=-1)
     async def on_phim_cb(client, cb: CallbackQuery):
+        try:
+            await _handle_phim_cb(client, cb)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            try:
+                await cb.answer(f"Lỗi: {str(e)[:150]}", show_alert=True)
+            except Exception:
+                pass
+
+    async def _handle_phim_cb(client, cb: CallbackQuery):
         if ban_check and ban_check(cb.message.chat.id, cb.from_user.id, cb.from_user.username or ""):
             await cb.answer("🚫 Bạn đã bị blacklist.", show_alert=True)
             return
